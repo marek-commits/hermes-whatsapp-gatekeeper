@@ -1,0 +1,14 @@
+{
+  "_comment": "Copy this file to ~/.hermes/whatsapp/gatekeeper_config.json and fill in your own values. Nothing here should stay as a literal placeholder in a real deployment.",
+  "enabled": true,
+  "owner_response_timeout_minutes": 240,
+  "max_rounds_dm": 5,
+  "max_rounds_group": 10,
+  "round_reset_hours": 4,
+  "owner_whatsapp_id": "<owner-msisdn>@s.whatsapp.net",
+  "assistant_name": "the assistant",
+  "owner_name": "the owner",
+  "intro_message_template_example": "Hi, this is {assistant_name} — {owner_name}'s assistant. {owner_name} can't get to messages right now, so I'm stepping in. You mentioned {topic} — want to work through that together?",
+  "group_auto_reply_enabled": false,
+  "_group_auto_reply_enabled_comment": "false = the assistant never automatically replies in group chats (listen/log only). true = normal automatic replies in groups. Flip and save — takes effect immediately, no restart needed."
+}

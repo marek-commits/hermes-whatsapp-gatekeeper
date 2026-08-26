@@ -1,0 +1,4 @@
+name: whatsapp-security-floor
+version: "1.0.0"
+description: "Zero out the built-in help/whoami always-allowed floor in gateway.slash_access, so non-admin WhatsApp senders get NO slash commands, no exceptions. Local override — see docs/architecture.md for the incident and reasoning. Lives in HERMES_HOME/plugins (not vendored src), so it survives hermes-update.sh image-sync automatically — no manual reapply needed."
+author: "marek-commits"
