@@ -180,6 +180,12 @@ Early-stage. This code has been extracted and generalized (translated, de-identi
 
 This is an independent, unofficial add-on — not affiliated with or endorsed by NousResearch. If upstream Hermes ever ships a native equivalent of #4281 or #527, parts of this project may become unnecessary. That would be a good outcome.
 
+## Looking for Ideas
+
+I built this for my own WhatsApp assistant, and I'm sharing it because the pattern might be useful beyond my own setup -- see "Why this exists" above for how it relates to [#4281](https://github.com/NousResearch/hermes-agent/issues/4281) and [#527](https://github.com/NousResearch/hermes-agent/issues/527) upstream. If you have ideas for where this should go next, issues and PRs are genuinely welcome. Honestly, I could use a hand taking it further -- let's see where this goes.
+
+---
+
 ## Requirements
 
 - A running [Hermes Agent](https://github.com/NousResearch/hermes-agent) instance with the WhatsApp (Baileys) channel enabled.
