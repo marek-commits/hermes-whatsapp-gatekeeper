@@ -1,0 +1,32 @@
+title = "hermes-whatsapp-gatekeeper gitleaks config"
+
+# Extend gitleaks' own actively-maintained default ruleset (API keys, tokens,
+# private keys, cloud credentials, etc.) and add two project-specific rules
+# on top of it. This repo's one historical incident was a real WhatsApp
+# MSISDN committed in an example config, not a classic API-key secret, so the
+# default ruleset alone would not have caught it -- these two rules close
+# that gap without the false-positive noise of a blanket "any long digit
+# run" pattern.
+[extend]
+useDefault = true
+
+[[rules]]
+id = "whatsapp-jid-with-real-number"
+description = "WhatsApp JID containing what looks like a real phone number -- the exact shape of this repo's one past leak"
+regex = '''\b\d{9,15}@(s\.whatsapp\.net|g\.us|lid)\b'''
+tags = ["pii", "phone-number", "whatsapp"]
+
+[[rules]]
+id = "e164-phone-number"
+description = "E.164-style phone number (+ prefix, 9-15 digits) -- this repo must stay fully generic, real phone numbers should never appear in it"
+regex = '''(?:^|[^\d.])\+\d{9,15}\b'''
+tags = ["pii", "phone-number"]
+
+[allowlist]
+description = "Known-safe placeholders used throughout the docs and example config"
+regexes = [
+  '''<owner-msisdn>''',
+]
+paths = [
+  '''(^|/)\.gitleaks\.toml$''',
+]
