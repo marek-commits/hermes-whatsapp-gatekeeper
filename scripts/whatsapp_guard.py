@@ -154,7 +154,7 @@ WIKI_EXTRACTION_PATTERNS = [
 
 # Telegram-injection patterns (same bilingual note as above).
 TELEGRAM_INJECTION_PATTERNS = [
-    re.compile(r'(napíš|pošli|odkáž|posli)\s+(to\s+)?(na|do)\s+(marekov\s+)?telegram', re.IGNORECASE),
+    re.compile(r'(napíš|pošli|odkáž|posli)\s+(to\s+)?(na|do)\s+(\w+\s+)?telegram', re.IGNORECASE),
     re.compile(r'telegram.*(správa|odkaz|notifikácia)', re.IGNORECASE),
     re.compile(r'prepošli\s+na\s+telegram', re.IGNORECASE),
     re.compile(r'(send|forward)\s+(this\s+)?to\s+(the\s+owner.?s\s+)?telegram', re.IGNORECASE),
