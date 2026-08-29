@@ -72,6 +72,17 @@ def load_gatekeeper_config() -> Dict[str, Any]:
         # directly, no restart needed (check_incoming reads the config live
         # on every message).
         "group_auto_reply_enabled": True,
+        # False = the assistant never creates wiki profiles for unknown/new people
+        # encountered in group chats or added to the DM allowlist -- existing
+        # profiles are still enriched normally. True = when the assistant first
+        # sees an unmatched sender in a group (picked up by the nightly
+        # profile-sync job) OR when a new number is added to the DM allowlist
+        # that the assistant can talk to, it automatically creates a minimal stub
+        # profile (bare facts only: name, phone, source, last message) in the
+        # wiki people folder -- no LLM call involved. Flip and save -- takes
+        # effect on the next nightly profile-sync run (not immediately, unlike
+        # group_auto_reply_enabled).
+        "remember_new_people_enabled": False,
     }
     if CONFIG_PATH.exists():
         try:
