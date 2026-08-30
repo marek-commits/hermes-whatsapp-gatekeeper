@@ -153,7 +153,7 @@ def test_listen_only_group_does_not_advance_round_counter(wg):
     cfg_path = wg.HERMES_HOME / "whatsapp" / "gatekeeper_config.json"
     cfg_path.write_text(json.dumps({"group_auto_reply_enabled": False}), encoding="utf-8")
     try:
-        group_chat = "1111122222@g.us"
+        group_chat = "listen-only-group@g.us"
         sender = "listen-only-sender@s.whatsapp.net"
         result = None
         for i in range(3):
