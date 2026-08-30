@@ -8,3 +8,12 @@ Once public, the expectations will be:
 - Keep security-relevant changes (anything touching `whatsapp_guard` or `whatsapp-security-floor`) small and well-explained — this code runs in front of an untrusted input channel, before the agent itself ever sees the message.
 - Favor plain, explicit code over cleverness. Security invariants (round limits, command lockdown) are enforced in code, not left to a prompt or skill to remember — see the README for why that distinction mattered in practice.
 - Add or update tests for any change to `whatsapp_guard`'s dispatch logic.
+
+## Running tests locally
+
+```bash
+pip install -r requirements-dev.txt
+pytest
+```
+
+Tests run against a throwaway `HERMES_HOME` sandbox (see `tests/conftest.py`) — no network, LLM, or Telegram calls, and nothing touches real WhatsApp state. CI runs the same suite on every push and PR (`.github/workflows/tests.yml`), alongside the existing gitleaks secret scan.

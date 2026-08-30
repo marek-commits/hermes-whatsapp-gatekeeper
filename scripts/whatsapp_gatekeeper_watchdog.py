@@ -14,7 +14,11 @@ the owner still hasn't replied, the watchdog:
    rounds_completed = 1.
 4. Notifies the owner (Telegram, by default) that the assistant took over.
 
-Version: 1.0.0
+Runs its per-conversation read-modify-write under the same per-chat lock as
+the gateway plugin (see scripts/whatsapp_guard.py's state_lock), so this
+process and a live incoming message can never race on the same state file.
+
+Version: 1.1.0 (hardened — locking + capped alerts)
 """
 
 from __future__ import annotations
@@ -42,6 +46,7 @@ from whatsapp_guard import (
     lookup_person_profile,
     ASSISTANT_NAME,
     OWNER_NAME,
+    state_lock,
 )
 
 BRIDGE_URL = os.environ.get("WHATSAPP_BRIDGE_URL", "http://localhost:3000")
@@ -49,6 +54,14 @@ BRIDGE_URL = os.environ.get("WHATSAPP_BRIDGE_URL", "http://localhost:3000")
 # Same owner-alert channel as plugins/whatsapp_guard — see its __init__.py
 # for notes on swapping this out for a different notification channel.
 _TELEGRAM_OWNER_CHAT_ID = os.environ.get("TELEGRAM_OWNER_CHAT_ID", "")
+
+# Telegram alert size caps (security review, medium finding): an unbounded
+# alert — many short messages, or one very long one — could exceed
+# Telegram's message-length limit and silently fail to deliver. Show only
+# the last N messages, each truncated, and cap the combined summary length
+# as a second line of defense.
+MAX_PENDING_MSGS_IN_ALERT = 10
+MAX_PENDING_SUMMARY_CHARS = 1500
 
 
 def _find_hermes_bin() -> str:
@@ -124,12 +137,33 @@ def process_pending_conversations() -> int:
 
         try:
             with open(state_file, "r", encoding="utf-8") as f:
-                state = json.load(f)
+                candidate = json.load(f)
+            chat_id = candidate.get("chat_id", "")
         except Exception:
             continue
+        if not chat_id:
+            continue
 
-        if state.get("status") == "pending_owner_reply" and is_owner_timeout_expired(state, timeout_minutes):
-            chat_id = state.get("chat_id", "")
+        # The gateway plugin and this cron process both mutate the same
+        # state file. Re-load it (not the copy read above, which was only
+        # used to get chat_id) AFTER acquiring the lock, and hold the SAME
+        # per-chat lock the gateway plugin uses for the entire takeover —
+        # the timeout check, sending the takeover message, and persisting
+        # the new state (security review, race-condition finding: without
+        # this, the gateway could process the owner's reply in the exact
+        # window between this process reading and writing the state file,
+        # and the assistant would send its takeover message anyway, right
+        # on top of a reply the owner just sent). Re-checking status after
+        # the lock deliberately favors a concurrent owner reply: this
+        # process waits for the lock, and once it gets it, re-verifies the
+        # status is still pending_owner_reply — if the owner replied in the
+        # meantime, the status will already have changed and the takeover
+        # is skipped.
+        with state_lock(chat_id):
+            state = load_state(chat_id)
+            if state.get("status") != "pending_owner_reply" or not is_owner_timeout_expired(state, timeout_minutes):
+                continue
+
             contact_name = state.get("contact_name", "") or chat_id
             pending_msgs = state.get("pending_messages", [])
             recent_msgs = state.get("recent_messages", [])
@@ -168,12 +202,17 @@ def process_pending_conversations() -> int:
                 # stays in whatever language the conversation itself is in —
                 # it isn't translated)
                 hours_str = f"{int(timeout_minutes // 60)}h" if timeout_minutes >= 60 else f"{int(timeout_minutes)}m"
-                pending_summary = "\n".join(f"• {m}" for m in pending_msgs) if pending_msgs else "(no text)"
+                _shown = pending_msgs[-MAX_PENDING_MSGS_IN_ALERT:]
+                pending_summary = "\n".join(f"• {m[:300]}" for m in _shown) if _shown else "(no text)"
+                if len(pending_summary) > MAX_PENDING_SUMMARY_CHARS:
+                    pending_summary = pending_summary[:MAX_PENDING_SUMMARY_CHARS] + "\n… (truncated)"
+                if len(pending_msgs) > MAX_PENDING_MSGS_IN_ALERT:
+                    pending_summary = f"(last {MAX_PENDING_MSGS_IN_ALERT} of {len(pending_msgs)})\n" + pending_summary
                 tg_alert = (
                     f"🤖 **{ASSISTANT_NAME} took over the WhatsApp conversation** (no reply from you for {hours_str})\n\n"
                     f"👤 **Contact:** {display_name} — {phone_display} (`{chat_id}`)\n\n"
                     f"📩 **Incoming messages:**\n{pending_summary}\n\n"
-                    f"💬 **{ASSISTANT_NAME}'s reply:**\n\"{intro_text}\"\n\n"
+                    f"💬 **{ASSISTANT_NAME}'s reply:**\n\"{intro_text[:1000]}\"\n\n"
                     f"ℹ️ _Reply directly on WhatsApp any time to take back over — {ASSISTANT_NAME} yields immediately._"
                 )
                 notify_owner_telegram(tg_alert)

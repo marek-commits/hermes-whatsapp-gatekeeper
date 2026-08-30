@@ -10,7 +10,5 @@
   "owner_name": "the owner",
   "intro_message_template_example": "Hi, this is {assistant_name} — {owner_name}'s assistant. {owner_name} can't get to messages right now, so I'm stepping in. You mentioned {topic} — want to work through that together?",
   "group_auto_reply_enabled": false,
-  "_group_auto_reply_enabled_comment": "false = the assistant never automatically replies in group chats (listen/log only). true = normal automatic replies in groups. Flip and save — takes effect immediately, no restart needed.",
-  "remember_new_people_enabled": false,
-  "_remember_new_people_enabled_comment": "false = the assistant never creates wiki profiles for unknown/new people encountered in group chats or added to the DM allowlist -- existing profiles are still enriched normally. true = when the assistant first sees an unmatched sender in a group (picked up by the nightly profile-sync job) OR when a new number is added to the DM allowlist that the assistant can already talk to, it automatically creates a minimal stub profile (bare facts only: name, phone, source, last message) in the wiki people folder -- no LLM call involved. Flip and save -- takes effect on the next nightly profile-sync run (not immediately, unlike group_auto_reply_enabled)."
+  "_group_auto_reply_enabled_comment": "false = the assistant never automatically replies in group chats (listen/log only). true = normal automatic replies in groups. Flip and save — takes effect immediately, no restart needed."
 }

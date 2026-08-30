@@ -14,9 +14,14 @@ Works INDEPENDENTLY of the LLM agent. Provides:
      recent messages and the contact's profile (if one is configured).
 2. Round counter (max 5 rounds in a DM / 10 rounds in a group).
 3. Hardening & security filters (slash commands, prompt injection, wiki
-   extraction, Telegram-injection attempts).
+   extraction, Telegram-injection attempts), diacritics/zero-width-character
+   normalized so accent-free or obfuscated messages can't slip past a
+   pattern written with full accents.
+4. Fail-closed error handling: a broken config file, a locking failure, or
+   an internal error in the checks above BLOCKS the message (instead of
+   silently running unfiltered) and alerts the owner out-of-band.
 
-Version: 2.1.0 (Personalized Delayed Gatekeeper)
+Version: 2.3.0 (Personalized Delayed Gatekeeper — hardened)
 """
 
 from __future__ import annotations
@@ -25,8 +30,12 @@ import glob
 import json
 import os
 import re
+import subprocess
 import sys
+import tempfile
 import time
+import unicodedata
+from contextlib import contextmanager
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
 from typing import Optional, Dict, Any, Tuple, List
@@ -54,6 +63,66 @@ PROFILE_ABOUT_HEADER = os.environ.get("WHATSAPP_GUARD_PROFILE_ABOUT_HEADER", "##
 PROFILE_STYLE_HEADER = os.environ.get("WHATSAPP_GUARD_PROFILE_STYLE_HEADER", "## Communication style")
 
 
+# ── Emergency owner alerts (fail-closed hardening) ────────────────────
+#
+# Deliberately self-contained — doesn't use STATE_DIR/load_state/etc — so it
+# keeps working even when the rest of this module is broken (e.g. the config
+# load below fails). Same `_find_hermes_bin()` / alert pattern as
+# plugins/whatsapp_guard/__init__.py and
+# scripts/whatsapp_gatekeeper_watchdog.py (deliberately duplicated, not
+# shared via import — every fail-safe point has to survive even if the
+# other two files are missing or broken).
+
+def _find_hermes_bin() -> str:
+    for candidate in [
+        os.environ.get("HERMES_BIN", ""),
+        "/app/venv/bin/hermes",
+        "/home/hermes/.hermes/hermes-agent/.venv/bin/hermes",
+        "/usr/local/bin/hermes",
+        "/usr/bin/hermes",
+    ]:
+        if candidate and os.path.isfile(candidate) and os.access(candidate, os.X_OK):
+            return candidate
+    return "hermes"
+
+
+_HERMES_BIN = _find_hermes_bin()
+_fail_alert_last_sent: Dict[str, float] = {}
+_FAIL_ALERT_COOLDOWN_SECONDS = 30 * 60  # 30 min between repeat alerts for the same cause
+
+
+def _alert_guard_failure(message: str, key: Optional[str] = None) -> None:
+    """Rate-limited owner alert — at most one per `key` (or per `message` if
+    no key is given) every _FAIL_ALERT_COOLDOWN_SECONDS. Without this, a
+    persistent failure (e.g. a permanently corrupt config file) would fire
+    one alert on EVERY incoming WhatsApp message instead of just one.
+    No-ops silently if TELEGRAM_OWNER_CHAT_ID isn't configured (see
+    plugins/whatsapp_guard/__init__.py for the same convention). Best
+    effort: this is called from already-broken code paths, so it must never
+    itself raise."""
+    try:
+        owner_chat_id = os.environ.get("TELEGRAM_OWNER_CHAT_ID", "")
+        if not owner_chat_id:
+            return
+        now = time.time()
+        k = (key or message)[:80]
+        last = _fail_alert_last_sent.get(k, 0)
+        if now - last < _FAIL_ALERT_COOLDOWN_SECONDS:
+            return
+        _fail_alert_last_sent[k] = now
+        subprocess.run(
+            [_HERMES_BIN, "send", "--to", f"telegram:{owner_chat_id}", message],
+            check=False,
+            capture_output=True,
+            timeout=10,
+        )
+    except Exception:
+        pass
+
+
+_CONFIG_LOAD_ERROR: Optional[str] = None
+
+
 def load_gatekeeper_config() -> Dict[str, Any]:
     """Loads configuration from gatekeeper_config.json, falling back to ENV and defaults."""
     defaults = {
@@ -72,25 +141,24 @@ def load_gatekeeper_config() -> Dict[str, Any]:
         # directly, no restart needed (check_incoming reads the config live
         # on every message).
         "group_auto_reply_enabled": True,
-        # False = the assistant never creates wiki profiles for unknown/new people
-        # encountered in group chats or added to the DM allowlist -- existing
-        # profiles are still enriched normally. True = when the assistant first
-        # sees an unmatched sender in a group (picked up by the nightly
-        # profile-sync job) OR when a new number is added to the DM allowlist
-        # that the assistant can talk to, it automatically creates a minimal stub
-        # profile (bare facts only: name, phone, source, last message) in the
-        # wiki people folder -- no LLM call involved. Flip and save -- takes
-        # effect on the next nightly profile-sync run (not immediately, unlike
-        # group_auto_reply_enabled).
-        "remember_new_people_enabled": False,
     }
+    global _CONFIG_LOAD_ERROR
     if CONFIG_PATH.exists():
         try:
             with open(CONFIG_PATH, "r", encoding="utf-8") as f:
                 data = json.load(f)
                 defaults.update(data)
-        except Exception:
-            pass
+            _CONFIG_LOAD_ERROR = None
+        except Exception as e:
+            # Do NOT silently fall back to these defaults — they can be more
+            # permissive than the operator's actual setting (e.g.
+            # group_auto_reply_enabled=True would silently re-enable replies
+            # in a group the operator muted via config). _check_incoming_core()
+            # checks this as its first step and fails closed (blocks + owner
+            # alert) instead of running on bad defaults.
+            _CONFIG_LOAD_ERROR = f"{type(e).__name__}: {e}"
+    else:
+        _CONFIG_LOAD_ERROR = None
 
     # ENV variables take precedence when explicitly set
     if "WHATSAPP_OWNER_TIMEOUT_MINUTES" in os.environ:
@@ -111,53 +179,103 @@ OWNER_TIMEOUT_MINUTES = float(CONFIG.get("owner_response_timeout_minutes", 240))
 ASSISTANT_NAME = str(CONFIG.get("assistant_name") or "the assistant")
 OWNER_NAME = str(CONFIG.get("owner_name") or "the owner")
 
-# Slash commands — starting with / or !
-SLASH_PATTERN = re.compile(r'^[/!]\w+', re.IGNORECASE)
+# Slash commands — starting with / or !. Requires a space or end-of-string
+# right after the first "word" — "/etc/hosts problem" no longer matches (it's
+# not a command, just text starting with a slash), while "/help" and
+# "/reset now" still do.
+SLASH_PATTERN = re.compile(r'^[/!]\w+(?:\s|$)', re.IGNORECASE)
 
-# Prompt-injection patterns. Includes both English and the original
-# deployment's Slovak-language examples — add patterns matching whatever
-# language(s) your own deployment is likely to be attacked in.
+
+def _normalize_for_detection(text: str) -> str:
+    """Normalization applied identically to the INPUT text and to the SOURCE
+    of every detection pattern:
+
+    1. NFD decomposition with combining marks stripped — e.g. Slovak 'zmeň'
+       -> 'zmen', 'čo vieš' -> 'co vies'. Messages typed without accents (a
+       common way to type on mobile in accented languages) used to sail
+       straight past every accented pattern, since the patterns themselves
+       were written with full accents.
+    2. Zero-width / formatting characters removed (ZWSP U+200B, ZWNJ
+       U+200C, soft hyphen U+00AD, bidi overrides…) — the cheapest trick for
+       sneaking a character past a regex.
+
+    Regex metacharacters pass through unchanged, so pattern sources stay
+    written (and readable) with full accents, and only get normalized at
+    compile time via _rx(). Unicode homoglyphs (e.g. Cyrillic 'а' standing
+    in for Latin 'a') are NOT handled — that stays a known limit of regex
+    detection; it's a limit of the tool, not of this filter specifically.
+    """
+    decomposed = unicodedata.normalize("NFD", text)
+    return "".join(
+        ch for ch in decomposed
+        if unicodedata.category(ch) not in ("Mn", "Cf")
+    )
+
+
+def _rx(pattern: str) -> "re.Pattern":
+    """Compiles a detection pattern from its (readable, accented) source and
+    applies the same normalization to it as to the text it's matched
+    against — see _normalize_for_detection()."""
+    return re.compile(_normalize_for_detection(pattern), re.IGNORECASE)
+
+
+# Prompt-injection patterns. Compiled via _rx() and matched against the
+# output of _normalize_for_detection(), so accents (or the lack of them) and
+# zero-width characters on either side no longer change the result. Includes
+# both English and the original deployment's Slovak-language examples — add
+# patterns matching whatever language(s) your own deployment is likely to be
+# attacked in.
 INJECTION_PATTERNS = [
-    re.compile(r'ignore\s+(previous|prior|all|above)\s+instructions?', re.IGNORECASE),
-    re.compile(r'act\s+as\s+(if|though|you)', re.IGNORECASE),
-    re.compile(r'you\s+are\s+now\s+', re.IGNORECASE),
-    re.compile(r'pretend\s+(that|you)', re.IGNORECASE),
-    re.compile(r'forget\s+(your|all|previous)\s+rules?', re.IGNORECASE),
-    re.compile(r'show\s+(me\s+)?(your|the)\s+(system\s+)?prompt', re.IGNORECASE),
-    re.compile(r'what\s+are\s+your\s+(system\s+)?instructions', re.IGNORECASE),
-    re.compile(r'developer\s+mode\s+(on|enabled)', re.IGNORECASE),
-    re.compile(r'reveal\s+(your|the)\s+(system\s+)?prompt', re.IGNORECASE),
-    re.compile(r'zmeň\s+(inštrukcie|pravidlá|správanie|nastavenie)', re.IGNORECASE),
-    re.compile(r'zabudni\s+(inštrukcie|pravidlá|všetko|predchádzajúce)', re.IGNORECASE),
-    re.compile(r'správaj\s+sa\s+ako', re.IGNORECASE),
-    re.compile(r'ty\s+si\s+teraz', re.IGNORECASE),
-    re.compile(r'prezraď\s+(systémový\s+)?prompt', re.IGNORECASE),
-    re.compile(r'aké\s+máš\s+(inštrukcie|pravidlá|príkazy)', re.IGNORECASE),
+    _rx(r'ignore\s+(previous|prior|all|above)\s+instructions?'),
+    _rx(r'act\s+as\s+(if|though|you)'),
+    _rx(r'you\s+are\s+now\s+'),
+    _rx(r'pretend\s+(that|you)'),
+    _rx(r'forget\s+(your|all|previous)\s+rules?'),
+    _rx(r'show\s+(me\s+)?(your|the)\s+(system\s+)?prompt'),
+    _rx(r'what\s+are\s+your\s+(system\s+)?instructions'),
+    _rx(r'developer\s+mode\s+(on|enabled)'),
+    _rx(r'reveal\s+(your|the)\s+(system\s+)?prompt'),
+    _rx(r'zmeň\s+(inštrukcie|pravidlá|správanie|nastavenie)'),
+    _rx(r'zabudni\s+(inštrukcie|pravidlá|všetko|predchádzajúce)'),
+    _rx(r'správaj\s+sa\s+ako'),
+    _rx(r'ty\s+si\s+teraz'),
+    _rx(r'prezraď\s+(systémový\s+)?prompt'),
+    _rx(r'aké\s+máš\s+(inštrukcie|pravidlá|príkazy)'),
 ]
 
 # Wiki / private-data extraction patterns (same bilingual note as above).
+#
+# Two overly broad patterns were narrowed in a security review (medium
+# finding, "false-positive regexes"):
+#   - the generic "what do you know about [anything]" was replaced with the
+#     two targeted patterns below, covering BOTH word orders ("čo o mne
+#     vieš" and the more natural "čo vieš o mne/o nás") without also
+#     catching an innocent "what do you know about [some other topic]".
+#   - the bare phrase "personal data/information" was narrowed to require a
+#     verb directed at the bot (have/see/know/share/show) — the bare phrase
+#     shows up in perfectly innocent contexts too (forms, GDPR boilerplate).
 WIKI_EXTRACTION_PATTERNS = [
-    re.compile(r'čo\s+(o\s+mne|o\s+nás)\s+(vieš|máš|je\s+napísané)', re.IGNORECASE),
-    re.compile(r'čo\s+vieš\s+o\s+', re.IGNORECASE),
-    re.compile(r'aké\s+(mám|máme)\s+(poznámky|informácie|dáta)', re.IGNORECASE),
-    re.compile(r'aký\s+(mám|máme)\s+(profil|záznam|súbor)', re.IGNORECASE),
-    re.compile(r'ukáž\s+(mi\s+)?(môj|náš)\s+(profil|záznam|kartu)', re.IGNORECASE),
-    re.compile(r'psycholog.*profil', re.IGNORECASE),
-    re.compile(r'osobné\s+(údaje|informácie|dáta)', re.IGNORECASE),
-    re.compile(r'wiki\s*(informácie|záznam|profil|obsah)', re.IGNORECASE),
-    re.compile(r'obsidian', re.IGNORECASE),
-    re.compile(r'interné\s+(poznámky|dokumenty|súbory)', re.IGNORECASE),
-    re.compile(r'what\s+(do\s+you\s+)?know\s+about\s+(me|us)', re.IGNORECASE),
-    re.compile(r'show\s+(me\s+)?my\s+(profile|file|record)', re.IGNORECASE),
-    re.compile(r'internal\s+(notes|documents|files)', re.IGNORECASE),
+    _rx(r'čo\s+(o\s+mne|o\s+nás)\s+(vieš|máš|je\s+napísané)'),
+    _rx(r'čo\s+vieš\s+o\s+(mne|nás)\b'),
+    _rx(r'aké\s+(mám|máme)\s+(poznámky|informácie|dáta)'),
+    _rx(r'aký\s+(mám|máme)\s+(profil|záznam|súbor)'),
+    _rx(r'ukáž\s+(mi\s+)?(môj|náš)\s+(profil|záznam|kartu)'),
+    _rx(r'psycholog.*profil'),
+    _rx(r'(máš|vidíš|poznáš|zdieľaj|ukáž)\s+(moje|naše)?\s*osobné\s+(údaje|informácie|dáta)'),
+    _rx(r'wiki\s*(informácie|záznam|profil|obsah)'),
+    _rx(r'obsidian'),
+    _rx(r'interné\s+(poznámky|dokumenty|súbory)'),
+    _rx(r'what\s+(do\s+you\s+)?know\s+about\s+(me|us)'),
+    _rx(r'show\s+(me\s+)?my\s+(profile|file|record)'),
+    _rx(r'internal\s+(notes|documents|files)'),
 ]
 
 # Telegram-injection patterns (same bilingual note as above).
 TELEGRAM_INJECTION_PATTERNS = [
-    re.compile(r'(napíš|pošli|odkáž|posli)\s+(to\s+)?(na|do)\s+(\w+\s+)?telegram', re.IGNORECASE),
-    re.compile(r'telegram.*(správa|odkaz|notifikácia)', re.IGNORECASE),
-    re.compile(r'prepošli\s+na\s+telegram', re.IGNORECASE),
-    re.compile(r'(send|forward)\s+(this\s+)?to\s+(the\s+owner.?s\s+)?telegram', re.IGNORECASE),
+    _rx(r'(napíš|pošli|odkáž|posli)\s+(to\s+)?(na|do)\s+(\w+\s+)?telegram'),
+    _rx(r'telegram.*(správa|odkaz|notifikácia)'),
+    _rx(r'prepošli\s+na\s+telegram'),
+    _rx(r'(send|forward)\s+(this\s+)?to\s+(the\s+owner.?s\s+)?telegram'),
 ]
 
 
@@ -188,7 +306,17 @@ def lookup_person_profile(chat_id: str, contact_name: str = "") -> Tuple[str, st
             if lid_clean in f:
                 try:
                     with open(f, "r", encoding="utf-8") as fp:
-                        phone = clean_digits(json.load(fp))
+                        raw = json.load(fp)
+                    # A malformed or unexpected reverse-mapping file (dict/list
+                    # instead of a plain string) used to get force-fed through
+                    # str()+clean_digits() unconditionally, which could produce
+                    # a bogus "phone number" that happened to match an unrelated
+                    # wiki profile. Only accept an actual string that, once
+                    # cleaned, looks like a real phone number.
+                    if isinstance(raw, str):
+                        candidate = clean_digits(raw)
+                        if len(candidate) >= 9:
+                            phone = candidate
                 except Exception:
                     pass
 
@@ -263,15 +391,116 @@ def get_state_file(chat_id: str, sender_id: str = "") -> Path:
     return STATE_DIR / filename
 
 
+try:
+    # POSIX only. Hermes runs on Linux; this just makes sure the module can
+    # still be imported (with locking degrading to a no-op) on a non-POSIX
+    # dev machine.
+    import fcntl
+except ImportError:  # pragma: no cover
+    fcntl = None
+
+
+@contextmanager
+def state_lock(chat_id: str, sender_id: str = ""):
+    """Cross-process exclusive lock around one conversation's read-modify-
+    write cycle. The gateway plugin and the watchdog cron run as separate
+    processes; without this, a takeover can overwrite a message that arrives
+    in the same instant (a lost update). Without fcntl (or if the lock file
+    can't be created), this degrades to a no-op — atomic writes
+    (_atomic_write_json) still guarantee a torn file is never produced,
+    just not protection against overlapping writes."""
+    if fcntl is None:
+        yield
+        return
+    lock_path = get_state_file(chat_id, sender_id).with_suffix(".lock")
+    try:
+        fh = open(lock_path, "a+")
+    except OSError:
+        yield
+        return
+    try:
+        fcntl.flock(fh, fcntl.LOCK_EX)
+        yield
+    finally:
+        try:
+            fcntl.flock(fh, fcntl.LOCK_UN)
+        finally:
+            fh.close()
+
+
+@contextmanager
+def _index_lock():
+    """Same as state_lock, but for the shared index.json (its read-modify-
+    write cycle spans every conversation at once). Always taken AFTER a
+    specific conversation's lock, never before it."""
+    if fcntl is None:
+        yield
+        return
+    lock_path = STATE_DIR / "index.lock"
+    try:
+        fh = open(lock_path, "a+")
+    except OSError:
+        yield
+        return
+    try:
+        fcntl.flock(fh, fcntl.LOCK_EX)
+        yield
+    finally:
+        try:
+            fcntl.flock(fh, fcntl.LOCK_UN)
+        finally:
+            fh.close()
+
+
+def _atomic_write_json(path: Path, payload: Dict[str, Any]) -> None:
+    """Atomically replaces `path`'s contents with `payload` serialized as
+    JSON.
+
+    Writes to a temp file in the same directory, fsyncs, then os.replace()
+    (atomic on both POSIX and Windows). A process crash or power loss
+    mid-write can no longer leave a truncated/empty state file behind —
+    a reader sees either the complete old file or the complete new one. A
+    torn file used to silently reset the round counter via the except-branch
+    in load_state — exactly the failure mode this guards against."""
+    tmp_fd, tmp_name = tempfile.mkstemp(
+        dir=str(path.parent), prefix=f".{path.name}.", suffix=".tmp"
+    )
+    try:
+        with os.fdopen(tmp_fd, "w", encoding="utf-8") as f:
+            json.dump(payload, f, ensure_ascii=False, indent=2)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp_name, path)
+    except Exception:
+        try:
+            os.unlink(tmp_name)
+        except OSError:
+            pass
+        raise
+
+
 def load_state(chat_id: str, sender_id: str = "") -> Dict[str, Any]:
-    """Loads conversation state from disk."""
+    """Loads conversation state from disk. A file that exists but fails to
+    parse is quarantined (renamed to *.corrupt-<epoch>.json) and reported to
+    stderr, instead of silently resetting the conversation."""
     path = get_state_file(chat_id, sender_id)
     if path.exists():
         try:
             with open(path, "r", encoding="utf-8") as f:
                 return json.load(f)
-        except Exception:
-            pass
+        except Exception as e:
+            quarantine = path.with_suffix(f".corrupt-{int(time.time())}.json")
+            try:
+                os.replace(path, quarantine)
+                moved = f"quarantined as {quarantine.name}"
+            except OSError:
+                moved = "left in place (rename failed)"
+            print(
+                f"[whatsapp_guard] Corrupt state file {path.name} ({e!r}); "
+                f"{moved} — continuing with fresh state (round counter for "
+                f"this chat has been reset)",
+                file=sys.stderr,
+            )
     is_group = chat_id.endswith("@g.us")
     return {
         "chat_id": chat_id,
@@ -293,11 +522,10 @@ def load_state(chat_id: str, sender_id: str = "") -> Dict[str, Any]:
 
 
 def save_state(chat_id: str, state: Dict[str, Any], sender_id: str = "") -> None:
-    """Saves conversation state to disk and updates the index."""
+    """Saves conversation state to disk (atomically) and updates the index."""
     path = get_state_file(chat_id, sender_id)
     try:
-        with open(path, "w", encoding="utf-8") as f:
-            json.dump(state, f, ensure_ascii=False, indent=2)
+        _atomic_write_json(path, state)
     except Exception as e:
         print(f"[whatsapp_guard] Error saving state for {chat_id}: {e}", file=sys.stderr)
 
@@ -305,8 +533,14 @@ def save_state(chat_id: str, state: Dict[str, Any], sender_id: str = "") -> None
 
 
 def _update_index(chat_id: str, state: Dict[str, Any], sender_id: str = "") -> None:
-    """Updates the central conversation index."""
+    """Updates the central conversation index (under _index_lock, so it
+    never interleaves with a concurrent write from the watchdog)."""
     index_file = STATE_DIR / "index.json"
+    with _index_lock():
+        _update_index_locked(index_file, chat_id, state, sender_id)
+
+
+def _update_index_locked(index_file: Path, chat_id: str, state: Dict[str, Any], sender_id: str = "") -> None:
     index = {}
     if index_file.exists():
         try:
@@ -339,8 +573,7 @@ def _update_index(chat_id: str, state: Dict[str, Any], sender_id: str = "") -> N
         })
 
     try:
-        with open(index_file, "w", encoding="utf-8") as f:
-            json.dump(index, f, ensure_ascii=False, indent=2)
+        _atomic_write_json(index_file, index)
     except Exception:
         pass
 
@@ -453,8 +686,8 @@ def register_incoming_dm_for_delay(chat_id: str, text: str, contact_name: str = 
     return state
 
 
-_MOJIBAKE_BIGRAMS = ("Ã¡", "Ã©", "Ã­", "Ã³", "Ãº", "Ã½", "Ä", "Å¡", "Å¾", "Ä¾",
-                     "Ã¤", "Ã´", "Å¥", "Åˆ", "Ä", "Ã„", "Å")
+_MOJIBAKE_BIGRAMS = ("Ã¡", "Ã©", "Ã­", "Ã³", "Ãº", "Ã½", "Ä", "Å¡", "Å¾", "Ä¾",
+                     "Ã¤", "Ã´", "Å¥", "Åˆ", "Ä", "Ã„", "Å")
 
 
 def _looks_mojibake(text: str) -> bool:
@@ -466,6 +699,28 @@ def _looks_mojibake(text: str) -> bool:
     if any(0x80 <= ord(ch) <= 0x9F for ch in text):
         return True
     return any(bg in text for bg in _MOJIBAKE_BIGRAMS)
+
+
+def _looks_like_profile_leak(text: str, about: str, comm_style: str) -> bool:
+    """Cheap safeguard against indirect prompt injection via pending_messages/
+    recent_messages (security review, medium finding — an output-filtering
+    gap): build_contextual_intro() puts the raw contact-profile fields
+    (about/comm_style — private relationship notes) into the LLM prompt. If
+    a contact talks the LLM into repeating that text back, it can show up in
+    the output almost verbatim — even though a takeover message is only
+    supposed to be a 1-2 sentence contextual greeting. Only flags longer
+    (>=25 char) contiguous matches, checked in 25-character windows, to
+    avoid false positives on ordinary short words/phrases."""
+    haystack = text.lower()
+    for field in (about, comm_style):
+        if not field or len(field) < 25:
+            continue
+        low = field.lower()
+        for i in range(0, len(low) - 25 + 1, 15):
+            chunk = low[i:i + 25].strip()
+            if len(chunk) >= 20 and chunk in haystack:
+                return True
+    return False
 
 
 def build_contextual_intro(
@@ -550,14 +805,25 @@ def build_contextual_intro(
             raw_msg = resp.choices[0].message.content.strip()
             # Strip a leading assistant-name prefix or stray quote marks
             cleaned = re.sub(rf'^({re.escape(ASSISTANT_NAME)}:\s*|["\'])', '', raw_msg).rstrip('"\'')
-            if cleaned and not _looks_mojibake(cleaned):
+            leak = _looks_like_profile_leak(cleaned, about, comm_style) if cleaned else False
+            if cleaned and not _looks_mojibake(cleaned) and not leak:
                 return cleaned
-            if cleaned:
+            if leak:
+                print(f"[whatsapp_guard] LLM intro rejected — possible profile leak (prompt injection?), using rule-based fallback: {cleaned!r}", file=sys.stderr)
+                _alert_guard_failure(
+                    f"🔒 The contextual takeover message for {contact_name or chat_id} was "
+                    f"blocked — possible attempt to exfiltrate profile data via prompt "
+                    f"injection in the incoming messages. A rule-based fallback message was "
+                    f"used instead of the LLM's reply.",
+                    key=f"profile_leak:{chat_id}",
+                )
+            elif cleaned:
                 print(f"[whatsapp_guard] LLM intro rejected — mojibake detected, using rule-based fallback: {cleaned!r}", file=sys.stderr)
     except Exception as e:
         print(f"[whatsapp_guard] LLM intro generation fallback due to: {e}", file=sys.stderr)
 
-    # Rule-based fallback (if the LLM call fails or times out)
+    # Rule-based fallback (if the LLM call fails, times out, or its output
+    # was rejected above)
     return (
         f"Hi {display_first_name}, it's {ASSISTANT_NAME} — {OWNER_NAME}'s assistant. "
         f"{OWNER_NAME} can't get to this right now, so I'm stepping in. Anything new on "
@@ -576,27 +842,33 @@ def detect_slash_command(text: str) -> Optional[str]:
 
 
 def detect_injection(text: str) -> Optional[str]:
-    """Detects a prompt-injection attempt."""
+    """Detects a prompt-injection attempt (accent-insensitive — see
+    _normalize_for_detection)."""
+    normalized = _normalize_for_detection(text)
     for pattern in INJECTION_PATTERNS:
-        match = pattern.search(text)
+        match = pattern.search(normalized)
         if match:
             return f"Injection pattern: {pattern.pattern[:60]}"
     return None
 
 
 def detect_wiki_extraction(text: str) -> Optional[str]:
-    """Detects an attempt to extract wiki / personal data."""
+    """Detects an attempt to extract wiki / personal data (accent-
+    insensitive — see _normalize_for_detection)."""
+    normalized = _normalize_for_detection(text)
     for pattern in WIKI_EXTRACTION_PATTERNS:
-        match = pattern.search(text)
+        match = pattern.search(normalized)
         if match:
             return f"Wiki extraction pattern: {pattern.pattern[:60]}"
     return None
 
 
 def detect_telegram_injection(text: str) -> Optional[str]:
-    """Detects an attempt to manipulate Telegram notifications."""
+    """Detects an attempt to manipulate Telegram notifications (accent-
+    insensitive — see _normalize_for_detection)."""
+    normalized = _normalize_for_detection(text)
     for pattern in TELEGRAM_INJECTION_PATTERNS:
-        match = pattern.search(text)
+        match = pattern.search(normalized)
         if match:
             return f"Telegram injection pattern: {pattern.pattern[:60]}"
     return None
@@ -610,17 +882,47 @@ def _check_incoming_core(
     contact_name: str = "",
     sender_id: str = "",
     from_me: bool = False,
+    group_reply_enabled: bool = True,
 ) -> Dict[str, Any]:
     """
     Main entry point for the pre_gateway_dispatch hook.
     Checks security, updates state, and drives the delayed-handover logic.
+
+    Every read-modify-write cycle on conversation state runs under
+    state_lock(), so the watchdog cron process can never interleave a
+    takeover in the middle of one (a lost update). `group_reply_enabled`
+    carries the group kill-switch (group_auto_reply_enabled) down from
+    check_incoming().
     """
     cfg = load_gatekeeper_config()
+
+    # 0. Fail-closed safeguard (security review, finding #1c): if the config
+    # couldn't be loaded, do NOT keep running on emergency defaults (they can
+    # be more permissive than the operator's actual setting — e.g. this
+    # could silently re-enable group_auto_reply_enabled in a group the
+    # operator muted). Block the message and send a rate-limited owner alert.
+    if _CONFIG_LOAD_ERROR:
+        _alert_guard_failure(
+            f"🚨 WhatsApp Guard FAIL-CLOSED: gatekeeper_config.json could not "
+            f"be loaded ({_CONFIG_LOAD_ERROR}). Messages are now BLOCKED (not "
+            f"running on defaults) until the config is fixed.",
+            key="config_load_error",
+        )
+        return {
+            "decision": "block",
+            "reason": f"Config load error (fail-closed): {_CONFIG_LOAD_ERROR}",
+            "action": "guard_failure",
+            "state": load_state(chat_id, sender_id),
+            "reply": None,
+            "telegram_notification": None,
+        }
+
     is_group = chat_id.endswith("@g.us")
 
     # 1. The owner is writing from a linked device (fromMe: true) into a DM
     if from_me and not is_group:
-        record_owner_reply(chat_id, text)
+        with state_lock(chat_id):
+            record_owner_reply(chat_id, text)
         return {
             "decision": "block",
             "reason": "Owner message recorded — assistant yields",
@@ -676,62 +978,92 @@ def _check_incoming_core(
             "telegram_notification": None,
         }
 
-    # 3. Round-limit check (if a conversation is already running with the assistant)
-    state = load_state(chat_id, sender_id)
-    if should_reset(state):
-        state["rounds_completed"] = 0
-        state["limit_exceeded"] = False
-        state["handoff_sent"] = False
-        state["status"] = "idle"
-        save_state(chat_id, state, sender_id)
-
-    round_limit = MAX_ROUNDS_GROUP if is_group else MAX_ROUNDS
-    if state.get("rounds_completed", 0) >= round_limit:
-        if not state.get("handoff_sent", False):
-            state["limit_exceeded"] = True
-            state["handoff_sent"] = True
+    # 2.5 Groups with auto-reply disabled (group_auto_reply_enabled = false):
+    # the security checks above stay fully active, but the round counter and
+    # the state machine only make sense once the assistant is actually
+    # replying. Advancing them on EVERY group message meant a busy, muted
+    # group would eventually trip a misleading "round limit reached" handoff
+    # alert (and then silently block everything after) for a conversation
+    # the assistant never actually joined. Logging the latest message still
+    # runs, so context is preserved for whenever the switch gets flipped
+    # back on.
+    if is_group and not group_reply_enabled:
+        with state_lock(chat_id, sender_id):
+            state = load_state(chat_id, sender_id)
+            _append_recent_message(state, "contact", text)
+            state["last_message_at"] = datetime.now(timezone.utc).isoformat()
+            state["last_topic"] = text[:100]
+            if contact_name:
+                state["contact_name"] = contact_name
             save_state(chat_id, state, sender_id)
-            return {
-                "decision": "block",
-                "reason": f"Round limit reached ({round_limit})",
-                "action": "handoff_to_telegram",
-                "state": state,
-                "reply": f"{OWNER_NAME} will take it from here. You'll hear back.",
-                "telegram_notification": f"📞 WhatsApp conversation with {contact_name or chat_id} reached the {round_limit}-round limit.\nLast topic: {text[:100]}\nHanding the conversation back to you.",
-            }
-        else:
-            return {
-                "decision": "block",
-                "reason": "Round limit already exceeded — silent",
-                "action": "silent_block",
-                "state": state,
-                "reply": None,
-                "telegram_notification": None,
-            }
+        return {
+            "decision": "block",
+            "reason": "Group auto-reply disabled (listen-only mode, gatekeeper_config.json)",
+            "action": "group_listen_only",
+            "state": state,
+            "reply": None,
+            "telegram_notification": None,
+        }
 
-    # 4. Delayed handover for DM messages.
-    # If enabled and the message is a DM and the conversation isn't already
-    # in an active assistant-handled mode:
-    if cfg.get("enabled", True) and not is_group:
-        if state.get("status") in ("idle", "pending_owner_reply", "handled_by_owner"):
-            # Register the message and delay the assistant's immediate reply
-            state = register_incoming_dm_for_delay(chat_id, text, contact_name)
-            return {
-                "decision": "block",
-                "reason": "Delaying for owner reply (Delayed Gatekeeper Mode)",
-                "action": "pending_owner_delay",
-                "state": state,
-                "reply": None,
-                "telegram_notification": None,
-            }
+    # 3-5. Round-limit check, delayed DM handover, and the standard direct
+    # reply — all under the conversation's lock, so the watchdog can't
+    # interleave a takeover in the middle of this state update.
+    with state_lock(chat_id, sender_id):
+        state = load_state(chat_id, sender_id)
+        if should_reset(state):
+            state["rounds_completed"] = 0
+            state["limit_exceeded"] = False
+            state["handoff_sent"] = False
+            state["status"] = "idle"
+            save_state(chat_id, state, sender_id)
 
-    # 5. Standard direct reply (groups, or once the assistant has already taken over)
-    state["rounds_completed"] = state.get("rounds_completed", 0) + 1
-    state["status"] = "in_progress_assistant"
-    state["last_message_at"] = datetime.now(timezone.utc).isoformat()
-    state["last_topic"] = text[:100]
-    _append_recent_message(state, "contact", text)
-    save_state(chat_id, state, sender_id)
+        round_limit = MAX_ROUNDS_GROUP if is_group else MAX_ROUNDS
+        if state.get("rounds_completed", 0) >= round_limit:
+            if not state.get("handoff_sent", False):
+                state["limit_exceeded"] = True
+                state["handoff_sent"] = True
+                save_state(chat_id, state, sender_id)
+                return {
+                    "decision": "block",
+                    "reason": f"Round limit reached ({round_limit})",
+                    "action": "handoff_to_telegram",
+                    "state": state,
+                    "reply": f"{OWNER_NAME} will take it from here. You'll hear back.",
+                    "telegram_notification": f"📞 WhatsApp conversation with {contact_name or chat_id} reached the {round_limit}-round limit.\nLast topic: {text[:100]}\nHanding the conversation back to you.",
+                }
+            else:
+                return {
+                    "decision": "block",
+                    "reason": "Round limit already exceeded — silent",
+                    "action": "silent_block",
+                    "state": state,
+                    "reply": None,
+                    "telegram_notification": None,
+                }
+
+        # 4. Delayed handover for DM messages.
+        # If enabled and the message is a DM and the conversation isn't already
+        # in an active assistant-handled mode:
+        if cfg.get("enabled", True) and not is_group:
+            if state.get("status") in ("idle", "pending_owner_reply", "handled_by_owner"):
+                # Register the message and delay the assistant's immediate reply
+                state = register_incoming_dm_for_delay(chat_id, text, contact_name)
+                return {
+                    "decision": "block",
+                    "reason": "Delaying for owner reply (Delayed Gatekeeper Mode)",
+                    "action": "pending_owner_delay",
+                    "state": state,
+                    "reply": None,
+                    "telegram_notification": None,
+                }
+
+        # 5. Standard direct reply (groups, or once the assistant has already taken over)
+        state["rounds_completed"] = state.get("rounds_completed", 0) + 1
+        state["status"] = "in_progress_assistant"
+        state["last_message_at"] = datetime.now(timezone.utc).isoformat()
+        state["last_topic"] = text[:100]
+        _append_recent_message(state, "contact", text)
+        save_state(chat_id, state, sender_id)
 
     return {
         "decision": "allow",
@@ -752,41 +1084,35 @@ def check_incoming(
 ) -> Dict[str, Any]:
     """
     Public entry point for the pre_gateway_dispatch hook. Calls
-    _check_incoming_core() for all security/state logic, then applies the
-    group mute switch (a fast kill-switch via gatekeeper_config.json's
+    _check_incoming_core() for all security/state logic, then passes down
+    the group mute switch (a fast kill-switch via gatekeeper_config.json's
     "group_auto_reply_enabled").
 
     When group auto-reply is disabled:
-    - a normal message that would otherwise get a reply (decision=allow) is
-      silently blocked (no reply, no Telegram notification — just an
-      ordinary group discussion).
+    - a normal group message never reaches the assistant and never advances
+      the round counter or the state machine (handled directly in
+      _check_incoming_core — see its step 2.5); no reply, no Telegram
+      notification.
     - security detections (slash/injection/wiki/telegram-injection) stay
       ACTIVE, and the Telegram alert about the attempt still goes out — only
       the reply into the group itself is suppressed (the assistant stays
       silent even when blocking).
     DM messages are entirely unaffected by this switch.
     """
-    result = _check_incoming_core(chat_id, text, contact_name, sender_id, from_me)
-
-    is_group = chat_id.endswith("@g.us")
-    if not is_group:
-        return result
-
     cfg = load_gatekeeper_config()
-    if cfg.get("group_auto_reply_enabled", True):
-        return result
+    is_group = chat_id.endswith("@g.us")
+    group_reply_enabled = cfg.get("group_auto_reply_enabled", True)
 
-    if result.get("decision") == "allow":
-        return {
-            "decision": "block",
-            "reason": "Group auto-reply disabled (listen-only mode, gatekeeper_config.json)",
-            "action": "group_listen_only",
-            "state": result.get("state"),
-            "reply": None,
-            "telegram_notification": None,
-        }
+    result = _check_incoming_core(
+        chat_id,
+        text,
+        contact_name,
+        sender_id,
+        from_me,
+        group_reply_enabled=group_reply_enabled,
+    )
 
-    if result.get("reply"):
+    if is_group and not group_reply_enabled and result.get("reply"):
         muted = dict(result)
         muted["reply"] = None
         return muted
@@ -795,5 +1121,5 @@ def check_incoming(
 
 
 if __name__ == "__main__":
-    print(f"WhatsApp Guard v2.1.0 loaded.")
+    print(f"WhatsApp Guard v2.3.0 loaded.")
     print(f"Config: timeout={OWNER_TIMEOUT_MINUTES} min, max_dm={MAX_ROUNDS}, max_group={MAX_ROUNDS_GROUP}")
