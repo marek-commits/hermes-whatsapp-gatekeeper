@@ -12,8 +12,12 @@ Works INDEPENDENTLY of the agent — provides:
    - If the owner doesn't reply within the configured window
      (gatekeeper_config.json), the watchdog takes over.
 2. Hardening & limits (slash commands, 5-round cap, injection, wiki extraction).
+3. Fail-closed error handling: if this plugin's own code, config, or import
+   breaks, WhatsApp messages are BLOCKED (not silently passed straight to the
+   agent unfiltered) and the owner gets an out-of-band alert — see the
+   "Emergency owner alerts" section below.
 
-Version: 2.0.0 (Modular Gatekeeper)
+Version: 2.3.0 (Modular Gatekeeper — hardened)
 """
 
 from __future__ import annotations
@@ -23,26 +27,23 @@ import os
 import subprocess
 import sys
 import threading
+import time
 from typing import Any, Dict, Optional
 
 logger = logging.getLogger(__name__)
 
-# ── Import whatsapp_guard from the scripts directory ─────────────────
 
-_SCRIPTS_DIR = os.path.join(os.environ.get("HERMES_HOME", "/home/hermes/.hermes"), "scripts")
-if _SCRIPTS_DIR not in sys.path:
-    sys.path.insert(0, _SCRIPTS_DIR)
-
-try:
-    from whatsapp_guard import check_incoming, load_gatekeeper_config
-    _GUARD_AVAILABLE = True
-    logger.info("WhatsApp Guard plugin loaded — whatsapp_guard.py available")
-except ImportError as e:
-    _GUARD_AVAILABLE = False
-    logger.warning("WhatsApp Guard plugin: could not import whatsapp_guard.py: %s", e)
-
-_ALWAYS_HARD_BLOCK_ACTIONS = {"warn_no_commands", "handoff_to_telegram", "silent_block", "pending_owner_delay", "owner_activity"}
-
+# ── Emergency owner alerts (fail-closed hardening) ────────────────────
+#
+# Deliberately defined BEFORE the `whatsapp_guard` import below — this has
+# to work even when that import itself fails (the most serious of the three
+# fail-open points a security review found here: a broken whatsapp_guard.py
+# used to mean the ENTIRE gatekeeper silently vanished from every WhatsApp
+# message, with nothing but a log line nobody was watching). The same
+# `_find_hermes_bin` / alert pattern is deliberately duplicated (not shared
+# via import) in scripts/whatsapp_guard.py and
+# scripts/whatsapp_gatekeeper_watchdog.py — every fail-safe point has to
+# survive even if the other two files are missing or broken.
 
 def _find_hermes_bin() -> str:
     for candidate in [
@@ -64,32 +65,6 @@ _HERMES_BIN = _find_hermes_bin()
 # address — leaving it unset just disables the side-channel alert, the
 # WhatsApp-side blocking/enforcement still works either way.
 _TELEGRAM_OWNER_CHAT_ID = os.environ.get("TELEGRAM_OWNER_CHAT_ID", "")
-
-
-# ── Platform detection ───────────────────────────────────────────────
-
-def _is_whatsapp(event: Any) -> bool:
-    """Checks whether the event came from the WhatsApp platform."""
-    source = getattr(event, "source", None)
-    if source is not None:
-        platform = getattr(source, "platform", None)
-        if platform is not None:
-            platform_str = platform.value if hasattr(platform, "value") else str(platform)
-            if "whatsapp" in platform_str.lower():
-                return True
-        cid = getattr(source, "chat_id", "") or ""
-        if "@s.whatsapp.net" in cid or "@lid" in cid or "@g.us" in cid:
-            return True
-    return False
-
-
-def _find_whatsapp_adapter(gateway: Any):
-    """Finds the WhatsApp adapter in gateway.adapters."""
-    adapters = getattr(gateway, "adapters", {}) or {}
-    for name, adapter in adapters.items():
-        if "whatsapp" in name.lower() and adapter is not None:
-            return adapter
-    return None
 
 
 def _send_telegram(message: str) -> None:
@@ -120,12 +95,93 @@ def _send_telegram(message: str) -> None:
     t.start()
 
 
+_fail_alert_last_sent: Dict[str, float] = {}
+_FAIL_ALERT_COOLDOWN_SECONDS = 30 * 60  # 30 min between repeat alerts for the same cause
+
+
+def _alert_guard_failure(message: str, key: Optional[str] = None) -> None:
+    """Rate-limited owner alert — at most one per `key` (or per `message` if
+    no key is given) every _FAIL_ALERT_COOLDOWN_SECONDS. Without this, a
+    persistent failure (e.g. a permanently broken import) would fire one
+    alert on EVERY incoming WhatsApp message instead of just one. Best
+    effort: this is called from already-broken code paths, so it must never
+    itself raise."""
+    try:
+        now = time.time()
+        k = (key or message)[:80]
+        last = _fail_alert_last_sent.get(k, 0)
+        if now - last < _FAIL_ALERT_COOLDOWN_SECONDS:
+            return
+        _fail_alert_last_sent[k] = now
+        _send_telegram(message)
+    except Exception:
+        pass
+
+
+# ── Import whatsapp_guard from the scripts directory ─────────────────
+
+_SCRIPTS_DIR = os.path.join(os.environ.get("HERMES_HOME", "/home/hermes/.hermes"), "scripts")
+if _SCRIPTS_DIR not in sys.path:
+    sys.path.insert(0, _SCRIPTS_DIR)
+
+try:
+    from whatsapp_guard import check_incoming, load_gatekeeper_config
+    _GUARD_AVAILABLE = True
+    logger.info("WhatsApp Guard plugin loaded — whatsapp_guard.py available")
+except ImportError as e:
+    _GUARD_AVAILABLE = False
+    logger.error(
+        "WhatsApp Guard plugin: could not import whatsapp_guard.py: %s — "
+        "FAIL-CLOSED (ALL WhatsApp messages will be blocked until fixed)", e
+    )
+    _alert_guard_failure(
+        f"🚨 WhatsApp Guard FAIL-CLOSED: could not import whatsapp_guard.py "
+        f"({e}). ALL WhatsApp messages are now blocked until this is fixed.",
+        key="import_error",
+    )
+
+# group_listen_only is deliberately in this set: WHATSAPP_GUARD_MODE=warn must
+# never re-enable automatic replies in a group the operator has muted via
+# group_auto_reply_enabled — warn mode exists to test *detection patterns*,
+# not to bypass an explicit kill-switch.
+_ALWAYS_HARD_BLOCK_ACTIONS = {"warn_no_commands", "handoff_to_telegram", "silent_block", "pending_owner_delay", "owner_activity", "group_listen_only"}
+
+
+# ── Platform detection ───────────────────────────────────────────────
+
+def _is_whatsapp(event: Any) -> bool:
+    """Checks whether the event came from the WhatsApp platform."""
+    source = getattr(event, "source", None)
+    if source is not None:
+        platform = getattr(source, "platform", None)
+        if platform is not None:
+            platform_str = platform.value if hasattr(platform, "value") else str(platform)
+            if "whatsapp" in platform_str.lower():
+                return True
+        cid = getattr(source, "chat_id", "") or ""
+        if "@s.whatsapp.net" in cid or "@lid" in cid or "@g.us" in cid:
+            return True
+    return False
+
+
+def _find_whatsapp_adapter(gateway: Any):
+    """Finds the WhatsApp adapter in gateway.adapters."""
+    adapters = getattr(gateway, "adapters", {}) or {}
+    for name, adapter in adapters.items():
+        if "whatsapp" in name.lower() and adapter is not None:
+            return adapter
+    return None
+
+
 # ── Hook callback ──────────────────────────────────────────────────────
 
 def _pre_gateway_dispatch_handler(event: Any, gateway: Any = None, **kwargs: Any) -> Optional[Dict[str, Any]]:
     """pre_gateway_dispatch hook callback."""
     if not _GUARD_AVAILABLE:
-        return None
+        # whatsapp_guard.py failed to import (the alert already went out
+        # above, at module load time) — FAIL-CLOSED instead of silently
+        # letting every WhatsApp message through with no filter at all.
+        return {"action": "skip", "reason": "WhatsApp Guard unavailable (fail-closed — see owner alert)"}
 
     if not _is_whatsapp(event):
         return None
@@ -144,6 +200,17 @@ def _pre_gateway_dispatch_handler(event: Any, gateway: Any = None, **kwargs: Any
     # fallback in case a future Hermes version changes this.
     _metadata = getattr(event, "metadata", None) or {}
     is_from_me = bool(_metadata.get("whatsapp_from_owner")) or getattr(event, "from_me", False) or getattr(source, "from_me", False)
+    if not is_from_me:
+        # Extra fallback via the config's owner_whatsapp_id (a security
+        # review flagged this value as unused dead config until now).
+        # Independent signal on top of the whatsapp_from_owner metadata
+        # above — adds a way to detect the owner, never removes one.
+        try:
+            _owner_id = load_gatekeeper_config().get("owner_whatsapp_id", "")
+            if _owner_id and str(sender_id) == _owner_id:
+                is_from_me = True
+        except Exception:
+            pass
 
     try:
         result = check_incoming(
@@ -154,8 +221,14 @@ def _pre_gateway_dispatch_handler(event: Any, gateway: Any = None, **kwargs: Any
             from_me=bool(is_from_me),
         )
     except Exception as e:
-        logger.warning("WhatsApp Guard: check_incoming raised %s — allowing through", e)
-        return None
+        logger.error("WhatsApp Guard: check_incoming raised %s — FAIL-CLOSED (blocking message)", e)
+        _alert_guard_failure(
+            f"🚨 WhatsApp Guard FAIL-CLOSED: check_incoming() failed for chat "
+            f"{chat_id} ({e}). This message was blocked instead of silently "
+            f"passed through.",
+            key="check_incoming_exception",
+        )
+        return {"action": "skip", "reason": f"WhatsApp Guard internal error (fail-closed): {e}"}
 
     decision = result.get("decision", "allow")
     if decision == "allow":
@@ -194,11 +267,14 @@ def _pre_gateway_dispatch_handler(event: Any, gateway: Any = None, **kwargs: Any
             adapter = _find_whatsapp_adapter(gateway)
             if adapter is not None:
                 import asyncio
-                loop = asyncio.get_event_loop()
-                if loop.is_running():
-                    asyncio.create_task(adapter.send(chat_id, reply))
+                try:
+                    loop = asyncio.get_running_loop()
+                except RuntimeError:
+                    loop = None
+                if loop is not None:
+                    loop.create_task(adapter.send(chat_id, reply))
                 else:
-                    loop.run_until_complete(adapter.send(chat_id, reply))
+                    asyncio.run(adapter.send(chat_id, reply))
         except Exception as e:
             logger.warning("WhatsApp Guard: failed to send reply to %s: %s", chat_id, e)
 
@@ -211,4 +287,4 @@ def _pre_gateway_dispatch_handler(event: Any, gateway: Any = None, **kwargs: Any
 def register(ctx: Any) -> None:
     """Plugin entry point."""
     ctx.register_hook("pre_gateway_dispatch", _pre_gateway_dispatch_handler)
-    logger.info("WhatsApp Guard plugin registered (v2.0.0) — pre_gateway_dispatch hook active")
+    logger.info("WhatsApp Guard plugin registered (v2.3.0) — pre_gateway_dispatch hook active")
