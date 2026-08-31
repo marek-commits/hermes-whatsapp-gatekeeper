@@ -17,7 +17,7 @@ Works INDEPENDENTLY of the agent — provides:
    agent unfiltered) and the owner gets an out-of-band alert — see the
    "Emergency owner alerts" section below.
 
-Version: 2.3.0 (Modular Gatekeeper — hardened)
+Version: 2.3.2 (Modular Gatekeeper — hardened + resilient import)
 """
 
 from __future__ import annotations
@@ -119,26 +119,100 @@ def _alert_guard_failure(message: str, key: Optional[str] = None) -> None:
 
 
 # ── Import whatsapp_guard from the scripts directory ─────────────────
+#
+# Incident (2026-08-31): this import was sometimes failing during
+# plugin-discovery runs OTHER than the real gateway process — e.g.
+# `hermes plugins doctor`. Confirmed directly on a live deployment: that
+# kind of run builds an ISOLATED temporary sandbox copy of the plugin
+# directory (e.g. /tmp/hermes-plugin-doctor-<id>/scripts) that does not
+# include scripts/ — so the import from there is GUARANTEED to fail, not
+# transient (no amount of retrying changes the fact that the directory
+# genuinely isn't there). A live restart of the real gateway process
+# (`hermes gateway run`) confirmed it always starts cleanly, first try,
+# against the real HERMES_HOME. Before fail-closed hardening, this
+# sandbox-only failure was invisible and harmless (silent fail-open).
+# After it, every such sandboxed run fired a "ALL messages blocked" owner
+# alert that had nothing to do with real message delivery.
+#
+# So: (1) if scripts_dir doesn't exist on disk at all, this is almost
+# certainly an isolated/sandboxed run — stay fail-closed for THIS process
+# (no compromise there), but skip the alert since it isn't a production
+# condition. (2) if scripts_dir exists and the import still fails, that's
+# a real problem (a genuine transient race, or an actually broken file) —
+# there a short bounded retry is worth it (rides out a real transient
+# cause), and the alert fires once retries are exhausted, carrying
+# diagnostic detail for fast triage if it recurs.
 
-_SCRIPTS_DIR = os.path.join(os.environ.get("HERMES_HOME", "/home/hermes/.hermes"), "scripts")
+_SCRIPTS_DIR = os.path.join(os.environ.get("HERMES_HOME") or "/home/hermes/.hermes", "scripts")
 if _SCRIPTS_DIR not in sys.path:
     sys.path.insert(0, _SCRIPTS_DIR)
 
-try:
-    from whatsapp_guard import check_incoming, load_gatekeeper_config
-    _GUARD_AVAILABLE = True
-    logger.info("WhatsApp Guard plugin loaded — whatsapp_guard.py available")
-except ImportError as e:
-    _GUARD_AVAILABLE = False
-    logger.error(
-        "WhatsApp Guard plugin: could not import whatsapp_guard.py: %s — "
-        "FAIL-CLOSED (ALL WhatsApp messages will be blocked until fixed)", e
+_IMPORT_RETRY_ATTEMPTS = 6
+_IMPORT_RETRY_DELAY_SECONDS = 0.3
+
+_guard_import_error: Optional[BaseException] = None
+_GUARD_AVAILABLE = False
+_scripts_dir_exists = os.path.isdir(_SCRIPTS_DIR)
+
+if not _scripts_dir_exists:
+    # scripts/ doesn't exist at all -> almost certainly an isolated/sandboxed
+    # run (e.g. `hermes plugins doctor`), not the real gateway process.
+    # Retrying would be pointless (the directory won't materialize in a
+    # few hundred ms) and alerting would be a false alarm — fail-closed for
+    # THIS process still applies, just in case.
+    _guard_import_error = ModuleNotFoundError("scripts dir not found (isolated/sandbox context)")
+    logger.info(
+        "WhatsApp Guard plugin: scripts dir %r does not exist in this process's "
+        "environment (pid=%d) — likely an isolated/sandboxed CLI invocation, not "
+        "the live gateway. Failing closed for this process only, no owner alert.",
+        _SCRIPTS_DIR, os.getpid(),
     )
-    _alert_guard_failure(
-        f"🚨 WhatsApp Guard FAIL-CLOSED: could not import whatsapp_guard.py "
-        f"({e}). ALL WhatsApp messages are now blocked until this is fixed.",
-        key="import_error",
-    )
+else:
+    for _attempt in range(1, _IMPORT_RETRY_ATTEMPTS + 1):
+        try:
+            from whatsapp_guard import check_incoming, load_gatekeeper_config
+            _GUARD_AVAILABLE = True
+            _guard_import_error = None
+            if _attempt > 1:
+                logger.warning(
+                    "WhatsApp Guard plugin loaded — whatsapp_guard.py available "
+                    "(succeeded on attempt %d/%d — earlier attempt(s) hit a transient "
+                    "import race, no message impact)",
+                    _attempt, _IMPORT_RETRY_ATTEMPTS,
+                )
+            else:
+                logger.info("WhatsApp Guard plugin loaded — whatsapp_guard.py available")
+            break
+        except ImportError as e:
+            _guard_import_error = e
+            if _attempt < _IMPORT_RETRY_ATTEMPTS:
+                logger.debug(
+                    "WhatsApp Guard plugin: import attempt %d/%d failed (%s) — retrying in %.2fs",
+                    _attempt, _IMPORT_RETRY_ATTEMPTS, e, _IMPORT_RETRY_DELAY_SECONDS,
+                )
+                time.sleep(_IMPORT_RETRY_DELAY_SECONDS)
+
+    if not _GUARD_AVAILABLE:
+        _diag = (
+            f"sys.path[:3]={sys.path[:3]!r} scripts_dir={_SCRIPTS_DIR!r} "
+            f"dir_exists={_scripts_dir_exists} "
+            f"file_exists={os.path.isfile(os.path.join(_SCRIPTS_DIR, 'whatsapp_guard.py'))} "
+            f"pid={os.getpid()}"
+        )
+        logger.error(
+            "WhatsApp Guard plugin: could not import whatsapp_guard.py after %d attempts "
+            "over %.1fs: %s — FAIL-CLOSED (ALL WhatsApp messages will be blocked until "
+            "fixed) [%s]",
+            _IMPORT_RETRY_ATTEMPTS,
+            _IMPORT_RETRY_ATTEMPTS * _IMPORT_RETRY_DELAY_SECONDS,
+            _guard_import_error, _diag,
+        )
+        _alert_guard_failure(
+            f"🚨 WhatsApp Guard FAIL-CLOSED: could not import whatsapp_guard.py even after "
+            f"{_IMPORT_RETRY_ATTEMPTS} attempts ({_guard_import_error}). ALL WhatsApp "
+            f"messages are now blocked until this is fixed.",
+            key="import_error",
+        )
 
 # group_listen_only is deliberately in this set: WHATSAPP_GUARD_MODE=warn must
 # never re-enable automatic replies in a group the operator has muted via
@@ -287,4 +361,4 @@ def _pre_gateway_dispatch_handler(event: Any, gateway: Any = None, **kwargs: Any
 def register(ctx: Any) -> None:
     """Plugin entry point."""
     ctx.register_hook("pre_gateway_dispatch", _pre_gateway_dispatch_handler)
-    logger.info("WhatsApp Guard plugin registered (v2.3.0) — pre_gateway_dispatch hook active")
+    logger.info("WhatsApp Guard plugin registered (v2.3.2) — pre_gateway_dispatch hook active")
