@@ -232,3 +232,78 @@ def test_profile_leak_detector(wg):
     about_text = "Dlhoročný priateľ, spolupracujú na projekte X od roku 2019, veľmi dôveryhodný vzťah"
     assert wg._looks_like_profile_leak(f"Ahoj! {about_text} co dalej?", about_text, "") is True
     assert wg._looks_like_profile_leak("Ahoj, dobre, poviem Marekovi.", about_text, "") is False
+
+
+# -- Bug fix (2026-09-01): contact mix-up in lookup_person_profile --------
+#
+# Live incident: an incoming message from a real contact's WhatsApp LID
+# was mis-attributed to a completely different wiki profile. Root cause
+# had two parts, both covered below:
+#   1. The file-by-file loop checked phone-match and name-match together
+#      for each profile and stopped at the FIRST match of either kind, so
+#      a wrong name-match on an earlier-iterated file could shadow a
+#      correct phone-match on a later one.
+#   2. The name-match fallback searched the token as a raw substring
+#      anywhere in the profile's full free-text body, so short (2-letter)
+#      abbreviation tokens from a WhatsApp push name could accidentally
+#      land inside unrelated words in a completely different profile.
+#
+# Fixture profiles below are entirely synthetic (no real contact data);
+# the body text of "decoy" deliberately embeds the same two-letter
+# fragments the abbreviated push name produces, inside unrelated words,
+# to reproduce the exact shape of the original false match.
+
+@pytest.fixture
+def two_person_wiki(tmp_path, monkeypatch, wg):
+    people_dir = tmp_path / "wiki-people"
+    people_dir.mkdir()
+
+    # The real sender: push name "Iv Dr" abbreviates "Ivy Drummond".
+    (people_dir / "ivy-drummond.md").write_text(
+        "---\n"
+        "telefon: 15550000002\n"
+        "---\n\n"
+        "## Kto to je\n"
+        "Ivy Drummond -- long-time collaborator, unrelated to the decoy profile.\n",
+        encoding="utf-8",
+    )
+
+    # The decoy: a different phone number, and body text that happens to
+    # contain "iv" and "dr" as substrings of unrelated words ("active",
+    # "drives") -- exactly the shape that used to cause a false match.
+    (people_dir / "no-relation-person.md").write_text(
+        "---\n"
+        "telefon: 15550000003\n"
+        "---\n\n"
+        "## Kto to je\n"
+        "Active in community drives and volunteering. No connection to Ivy.\n",
+        encoding="utf-8",
+    )
+
+    monkeypatch.setattr(wg, "PEOPLE_DIR", people_dir)
+    return people_dir
+
+
+def test_phone_match_takes_priority_over_name_match_across_all_files(wg, two_person_wiki):
+    session_dir = wg.SESSION_DIR
+    session_dir.mkdir(parents=True, exist_ok=True)
+    lid_id = "999888777000111"
+    mapping_file = session_dir / f"lid-mapping-{lid_id}_reverse.json"
+    mapping_file.write_text(json.dumps("15550000002"), encoding="utf-8")
+    try:
+        # contact_name's tokens ("iv", "dr") would false-positive-match the
+        # decoy's body text under the old bug; the real phone (resolved via
+        # the LID mapping above) must win regardless.
+        name, about, style, phone = wg.lookup_person_profile(f"{lid_id}@lid", "Iv Dr")
+        assert name == "Ivy Drummond"
+    finally:
+        mapping_file.unlink(missing_ok=True)
+
+
+def test_name_fallback_matches_filename_prefix_not_body_text(wg, two_person_wiki):
+    # No resolvable phone at all -- forces the name-token fallback path.
+    # Tokens "iv"/"dr" must match via filename-prefix ("ivy"/"drummond"),
+    # not via the decoy's body text, even though the decoy's body also
+    # contains those same two-letter substrings.
+    name, about, style, phone = wg.lookup_person_profile("no-phone-chat-id", "Iv Dr")
+    assert name == "Ivy Drummond"

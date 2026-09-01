@@ -21,7 +21,7 @@ Works INDEPENDENTLY of the LLM agent. Provides:
    an internal error in the checks above BLOCKS the message (instead of
    silently running unfiltered) and alerts the owner out-of-band.
 
-Version: 2.3.0 (Personalized Delayed Gatekeeper — hardened)
+Version: 2.3.3 (Personalized Delayed Gatekeeper — hardened, contact-match fix)
 """
 
 from __future__ import annotations
@@ -321,31 +321,58 @@ def lookup_person_profile(chat_id: str, contact_name: str = "") -> Tuple[str, st
                     pass
 
     found_profile: Optional[Tuple[str, str]] = None
+    wiki_files: List[Tuple[str, str]] = []
     if PEOPLE_DIR.exists():
         for f in glob.glob(f"{PEOPLE_DIR}/*.md"):
             base = os.path.basename(f)
             if base.startswith("_") or base == "index.md":
                 continue
+            wiki_files.append((f, base))
+
+    # Fix (2026-09-01, live incident): an exact phone/LID match must take
+    # unconditional priority over the name-token fallback across ALL
+    # profiles — not just within a single file during one pass of the loop.
+    # The previous code checked phone AND name for each file in turn and
+    # stopped at the first match of either kind; if an earlier file (in
+    # glob.glob() order) won on a wrong name match, the correct later file
+    # with a matching phone number was never even reached. Now the phone
+    # pass runs to completion across every file first; the name-token pass
+    # only runs as a fallback when no phone match was found anywhere.
+    if phone and len(phone) >= 9:
+        for f, base in wiki_files:
             try:
                 with open(f, "r", encoding="utf-8") as fp:
                     content = fp.read()
-                    if phone and len(phone) >= 9 and phone in clean_digits(content):
-                        found_profile = (f, content)
-                        break
-                    if contact_name and len(contact_name) >= 3:
-                        # Token-based match (not a contiguous substring): a
-                        # WhatsApp push-name is often "Last First" (e.g.
-                        # "Doe John"), while notes/filenames tend to use the
-                        # natural order "John Doe". Every word of the name
-                        # must appear somewhere in the content or filename,
-                        # regardless of order.
-                        name_tokens = [t for t in re.findall(r"\w+", contact_name.lower()) if len(t) >= 2]
-                        haystack = content.lower() + " " + base.lower()
-                        if name_tokens and all(t in haystack for t in name_tokens):
-                            found_profile = (f, content)
-                            break
+                if phone in clean_digits(content):
+                    found_profile = (f, content)
+                    break
             except Exception:
                 pass
+
+    if not found_profile and contact_name and len(contact_name) >= 3:
+        # Token-based match (not a contiguous substring): a WhatsApp
+        # push-name is often an abbreviation or different order of the real
+        # name (e.g. "J D" for "John Doe"). Fix (2026-09-01): every token
+        # now has to be a PREFIX of some word in the FILENAME (not anywhere
+        # in the note body). Previously it also searched the raw body text,
+        # which let short (2-letter) abbreviation tokens accidentally land
+        # inside unrelated words in a completely different profile — a live
+        # incident matched two such tokens from an abbreviated push name
+        # against unrelated substrings in someone else's notes, and the
+        # correct profile (which had a matching phone number) was never
+        # reached because of the priority bug fixed just above.
+        name_tokens = [t for t in re.findall(r"\w+", contact_name.lower()) if len(t) >= 2]
+        if name_tokens:
+            for f, base in wiki_files:
+                filename_words = re.findall(r"\w+", base.lower())
+                if all(any(w.startswith(t) for w in filename_words) for t in name_tokens):
+                    try:
+                        with open(f, "r", encoding="utf-8") as fp:
+                            content = fp.read()
+                        found_profile = (f, content)
+                        break
+                    except Exception:
+                        pass
 
     if found_profile:
         filepath, content = found_profile
@@ -1121,5 +1148,5 @@ def check_incoming(
 
 
 if __name__ == "__main__":
-    print(f"WhatsApp Guard v2.3.0 loaded.")
+    print(f"WhatsApp Guard v2.3.3 loaded.")
     print(f"Config: timeout={OWNER_TIMEOUT_MINUTES} min, max_dm={MAX_ROUNDS}, max_group={MAX_ROUNDS_GROUP}")
