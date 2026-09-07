@@ -12,6 +12,7 @@ Runs entirely against a throwaway HERMES_HOME (see conftest.py): no
 network, no LLM, no Telegram calls, no real production state.
 """
 import json
+import os
 
 import pytest
 
@@ -307,3 +308,54 @@ def test_name_fallback_matches_filename_prefix_not_body_text(wg, two_person_wiki
     # contains those same two-letter substrings.
     name, about, style, phone = wg.lookup_person_profile("no-phone-chat-id", "Iv Dr")
     assert name == "Ivy Drummond"
+
+
+# ── alert_profile / alert_env (v2.4.0) ────────────────────────────────
+#
+# In a multiplexed gateway `hermes send` resolves its credentials from
+# HERMES_HOME, so an alert raised while serving profile X would otherwise go
+# out through whichever profile happens to be current. alert_env() pins the
+# subprocess to the profile named by "alert_profile".
+
+
+def _write_gatekeeper_config(wg, **values):
+    """Writes CONFIG_PATH so load_gatekeeper_config() picks the values up live."""
+    wg.CONFIG_PATH.parent.mkdir(parents=True, exist_ok=True)
+    wg.CONFIG_PATH.write_text(json.dumps(values), encoding="utf-8")
+
+
+def test_alert_env_unchanged_when_no_alert_profile(wg):
+    _write_gatekeeper_config(wg, alert_profile="")
+    try:
+        env = wg.alert_env()
+        assert env.get("HERMES_HOME") == os.environ.get("HERMES_HOME")
+    finally:
+        wg.CONFIG_PATH.unlink(missing_ok=True)
+
+
+def test_alert_env_unchanged_for_default_profile(wg):
+    _write_gatekeeper_config(wg, alert_profile="default")
+    try:
+        assert wg.alert_env().get("HERMES_HOME") == os.environ.get("HERMES_HOME")
+    finally:
+        wg.CONFIG_PATH.unlink(missing_ok=True)
+
+
+def test_alert_env_points_at_named_profile_home(wg):
+    profile_home = wg.HERMES_HOME / "profiles" / "alerts-test"
+    profile_home.mkdir(parents=True, exist_ok=True)
+    _write_gatekeeper_config(wg, alert_profile="alerts-test")
+    try:
+        assert wg.alert_env()["HERMES_HOME"] == str(profile_home)
+    finally:
+        wg.CONFIG_PATH.unlink(missing_ok=True)
+
+
+def test_alert_env_ignores_unknown_profile(wg):
+    # A typo in the config must not break alerting -- it falls back to the
+    # current profile rather than pointing at a directory that isn't there.
+    _write_gatekeeper_config(wg, alert_profile="no-such-profile")
+    try:
+        assert wg.alert_env().get("HERMES_HOME") == os.environ.get("HERMES_HOME")
+    finally:
+        wg.CONFIG_PATH.unlink(missing_ok=True)
