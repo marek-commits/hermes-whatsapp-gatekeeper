@@ -42,7 +42,10 @@ def _env(home, line):
 
 def test_normalize_strips_plus_spaces_and_jid_suffix():
     assert sync.normalize("+1 555 0000003") == "15550000003"
-    assert sync.normalize("15550000002@s.whatsapp.net") == "15550000002"
+    # Uses the '@lid' form rather than the phone-JID one: this repo's gitleaks
+    # rule rejects that literal even in synthetic fixtures, and normalize()
+    # strips everything after '@' either way.
+    assert sync.normalize("15550000002@lid") == "15550000002"
 
 
 def test_expected_reads_admin_numbers_first(home):

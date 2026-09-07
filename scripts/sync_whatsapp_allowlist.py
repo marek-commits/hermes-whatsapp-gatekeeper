@@ -62,7 +62,7 @@ def profile_home(profile: str) -> Path:
 
 
 def normalize(value) -> str:
-    """'+421 900 123' / '421900123@s.whatsapp.net' -> '421900123'."""
+    """Strips a leading '+', any spaces, and an '@<suffix>' JID/LID tail."""
     return str(value).strip().lstrip("+").split("@")[0].replace(" ", "")
 
 
