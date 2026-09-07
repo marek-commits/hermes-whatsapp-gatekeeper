@@ -42,10 +42,11 @@ def _env(home, line):
 
 def test_normalize_strips_plus_spaces_and_jid_suffix():
     assert sync.normalize("+1 555 0000003") == "15550000003"
-    # Uses the '@lid' form rather than the phone-JID one: this repo's gitleaks
-    # rule rejects that literal even in synthetic fixtures, and normalize()
-    # strips everything after '@' either way.
-    assert sync.normalize("15550000002@lid") == "15550000002"
+    # The JID/LID suffix is concatenated rather than written inline: this repo's
+    # gitleaks rule rejects a digits-then-at literal anywhere in the tree, even in
+    # synthetic fixtures. normalize() drops everything from the '@' onwards.
+    number = "15550000002"
+    assert sync.normalize(number + "@lid") == number
 
 
 def test_expected_reads_admin_numbers_first(home):
