@@ -87,6 +87,33 @@ def _find_hermes_bin() -> str:
 
 
 _HERMES_BIN = _find_hermes_bin()
+
+def alert_env() -> Dict[str, str]:
+    """Environment for the `hermes send` subprocess used by owner alerts.
+
+    `hermes send` resolves platform credentials from ``HERMES_HOME``. In a
+    multiplexed gateway (one process serving several profiles) that means an
+    alert raised while handling WhatsApp for profile X would go out through
+    whichever profile happens to be "current" — usually the default one — so
+    the owner gets gatekeeper alerts from the wrong bot.
+
+    ``alert_profile`` in gatekeeper_config.json pins them to the profile that
+    actually owns the WhatsApp channel. Empty or "default" keeps the previous
+    behaviour. Unknown profile names are ignored (the alert still goes out).
+    """
+    env = dict(os.environ)
+    try:
+        profile = str(load_gatekeeper_config().get("alert_profile") or "").strip()
+    except Exception:
+        return env
+    if not profile or profile == "default":
+        return env
+    root = HERMES_HOME.parent if HERMES_HOME.parent.name == "profiles" else HERMES_HOME / "profiles"
+    home = root / profile
+    if home.is_dir():
+        env["HERMES_HOME"] = str(home)
+    return env
+
 _fail_alert_last_sent: Dict[str, float] = {}
 _FAIL_ALERT_COOLDOWN_SECONDS = 30 * 60  # 30 min between repeat alerts for the same cause
 
@@ -115,6 +142,7 @@ def _alert_guard_failure(message: str, key: Optional[str] = None) -> None:
             check=False,
             capture_output=True,
             timeout=10,
+            env=alert_env(),
         )
     except Exception:
         pass
@@ -135,6 +163,12 @@ def load_gatekeeper_config() -> Dict[str, Any]:
         "owner_whatsapp_id": "",
         "assistant_name": "the assistant",
         "owner_name": "the owner",
+        # Profile whose bot delivers owner alerts. Empty or "default"
+        # keeps the current profile (previous behaviour). Set this to the
+        # profile that owns the WhatsApp channel when the gateway
+        # multiplexes several profiles — otherwise alerts arrive from
+        # whichever bot happens to be current. Read live, no restart.
+        "alert_profile": "",
         # False = the assistant's automatic replies in group chats are
         # disabled (listen/log only). True = normal automatic replies in
         # groups. This is a fast kill-switch — edit gatekeeper_config.json

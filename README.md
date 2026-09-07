@@ -87,12 +87,14 @@ hermes-whatsapp-gatekeeper/
 │       └── __init__.py                      # closes Hermes' built-in /help and /whoami allowlist floor
 ├── scripts/
 │   ├── whatsapp_guard.py                    # Core deterministic logic, regex filters & persistence
-│   └── whatsapp_gatekeeper_watchdog.py      # Scheduled background takeover monitor
+│   ├── whatsapp_gatekeeper_watchdog.py      # Scheduled background takeover monitor
+│   └── sync_whatsapp_allowlist.py          # Keeps config.yaml allow_from and WHATSAPP_ALLOWED_USERS in sync
 ├── skills/
 │   └── whatsapp-conversation-rules/
 │       └── SKILL.md                         # Persona, humanizer guidelines & round-based escalation rules
 └── docs/
     ├── update-integration.md                # generic idempotent-reapply pattern, for if you ever need a direct source patch
+    ├── multiplex-profiles.md                # running the gatekeeper under a dedicated profile: the silent failure modes
     └── architecture.md                      # defense-in-depth overview and design notes
 ```
 
@@ -113,6 +115,7 @@ All runtime options are decoupled from application logic:
   "max_rounds_group": 10,
   "round_reset_hours": 4,
   "owner_whatsapp_id": "<owner-msisdn>@s.whatsapp.net",
+  "alert_profile": "",
   "intro_message_template_example": "Hi, this is {assistant_name} — {owner_name}'s assistant. {owner_name} can't get to messages right now, so I'm stepping in. You mentioned {topic} — want to work through that together?"
 }
 ```
@@ -127,6 +130,25 @@ All runtime options are decoupled from application logic:
 | `max_rounds_group` / `WHATSAPP_GUARD_GROUP_ROUND_LIMIT` | Max conversational turns in group chats | `10` |
 | `round_reset_hours` | Inactivity period before resetting counters | `4` hours |
 | `WHATSAPP_GUARD_MODE` | Enforcement mode (`block` or `warn`) | `block` |
+| `alert_profile` | Profile whose bot delivers owner alerts. Only matters when one gateway process serves several profiles — otherwise alerts arrive from whichever bot happens to be current. Empty = current profile. | `""` |
+
+### The DM allowlist lives in the environment, not in `config.yaml`
+
+The WhatsApp bridge reads `WHATSAPP_ALLOWED_USERS` and nothing else. `allow_from` in
+`config.yaml` never reaches it, so editing the config alone looks like it worked and
+silently changes nothing — and `WHATSAPP_ALLOW_ALL_USERS=true` or
+`WHATSAPP_ALLOWED_USERS=*` makes the config allowlist decorative altogether.
+
+```bash
+python3 scripts/sync_whatsapp_allowlist.py --profile <profile> --show   # compare both sides
+python3 scripts/sync_whatsapp_allowlist.py --profile <profile> --check  # silent when in sync
+python3 scripts/sync_whatsapp_allowlist.py --profile <profile> --fix    # rewrite .env from config
+```
+
+Run `--check` from a daily job and you will hear about drift instead of discovering it
+from a conversation. See [docs/multiplex-profiles.md](docs/multiplex-profiles.md) for the
+rest of the per-profile failure modes, including why removing a contact from the allowlist
+also disables owner-takeover detection for that chat.
 
 ---
 

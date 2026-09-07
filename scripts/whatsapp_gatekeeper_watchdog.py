@@ -98,6 +98,28 @@ def send_whatsapp_message(chat_id: str, message: str) -> bool:
         return False
 
 
+def _alert_env() -> Dict[str, str]:
+    """Environment for the `hermes send` subprocess (see alert_profile).
+
+    Deliberately duplicated from scripts/whatsapp_guard.py rather than
+    imported: every fail-safe point in this project has to keep working even
+    if the other files are missing or broken.
+    """
+    env = dict(os.environ)
+    try:
+        with open(CONFIG_PATH, "r", encoding="utf-8") as f:
+            profile = str((json.load(f) or {}).get("alert_profile") or "").strip()
+    except Exception:
+        return env
+    if not profile or profile == "default":
+        return env
+    root = HERMES_HOME.parent if HERMES_HOME.parent.name == "profiles" else HERMES_HOME / "profiles"
+    home = root / profile
+    if home.is_dir():
+        env["HERMES_HOME"] = str(home)
+    return env
+
+
 def notify_owner_telegram(message: str) -> None:
     """Sends an owner-facing notification (Telegram, by default).
 
@@ -112,6 +134,7 @@ def notify_owner_telegram(message: str) -> None:
             capture_output=True,
             text=True,
             timeout=15,
+            env=_alert_env(),
         )
         if result.returncode != 0:
             print(f"[watchdog] Telegram delivery failed (code {result.returncode}): {result.stderr.strip()}", file=sys.stderr)

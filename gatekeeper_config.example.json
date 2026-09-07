@@ -10,5 +10,7 @@
   "owner_name": "the owner",
   "intro_message_template_example": "Hi, this is {assistant_name} — {owner_name}'s assistant. {owner_name} can't get to messages right now, so I'm stepping in. You mentioned {topic} — want to work through that together?",
   "group_auto_reply_enabled": false,
-  "_group_auto_reply_enabled_comment": "false = the assistant never automatically replies in group chats (listen/log only). true = normal automatic replies in groups. Flip and save — takes effect immediately, no restart needed."
+  "_group_auto_reply_enabled_comment": "false = the assistant never automatically replies in group chats (listen/log only). true = normal automatic replies in groups. Flip and save — takes effect immediately, no restart needed.",
+  "alert_profile": "",
+  "_alert_profile_comment": "Profile whose bot delivers owner alerts (owner takeover, round limit, fail-closed). Empty or \"default\" = current profile. Set this to the profile that owns the WhatsApp channel when one gateway process serves several profiles, otherwise alerts arrive from the wrong bot. Read live, no restart."
 }
