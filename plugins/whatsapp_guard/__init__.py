@@ -23,6 +23,7 @@ Version: 2.3.2 (Modular Gatekeeper — hardened + resilient import)
 from __future__ import annotations
 
 import logging
+import json
 import os
 import subprocess
 import sys
@@ -67,6 +68,37 @@ _HERMES_BIN = _find_hermes_bin()
 _TELEGRAM_OWNER_CHAT_ID = os.environ.get("TELEGRAM_OWNER_CHAT_ID", "")
 
 
+def _alert_env() -> dict:
+    """Environment for the `hermes send` subprocess (see alert_profile).
+
+    `hermes send` resolves platform credentials from HERMES_HOME, so in a
+    multiplexed gateway a notification raised while serving profile X would go
+    out through whichever profile is current -- the owner gets gatekeeper
+    notifications from the wrong bot. ``alert_profile`` in
+    gatekeeper_config.json pins them to the profile that owns the WhatsApp
+    channel; empty or "default" keeps the previous behaviour.
+
+    Deliberately self-contained (no import from scripts/whatsapp_guard.py):
+    this file has to keep working even when that module is missing or broken.
+    """
+    env = dict(os.environ)
+    try:
+        base = os.environ.get("HERMES_HOME") or os.path.expanduser("~/.hermes")
+        cfg_path = os.path.join(base, "whatsapp", "gatekeeper_config.json")
+        with open(cfg_path, "r", encoding="utf-8") as f:
+            profile = str((json.load(f) or {}).get("alert_profile") or "").strip()
+    except Exception:
+        return env
+    if not profile or profile == "default":
+        return env
+    root = os.path.dirname(base) if os.path.basename(os.path.dirname(base)) == "profiles" \
+        else os.path.join(base, "profiles")
+    home = os.path.join(root, profile)
+    if os.path.isdir(home):
+        env["HERMES_HOME"] = home
+    return env
+
+
 def _send_telegram(message: str) -> None:
     """Sends an owner-facing alert asynchronously in a daemon thread.
 
@@ -87,6 +119,7 @@ def _send_telegram(message: str) -> None:
                 check=False,
                 capture_output=True,
                 timeout=10,
+                env=_alert_env(),
             )
         except Exception as e:
             logger.warning("WhatsApp Guard: Telegram send failed: %s", e)
