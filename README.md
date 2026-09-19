@@ -38,6 +38,7 @@ This project grew out of a real incident: a WhatsApp contact drove a conversatio
 * 🧯 **Fail-Closed, Not Fail-Open:** If the guard's own code, its config file, or its import into the gateway breaks, WhatsApp messages are BLOCKED — not silently passed straight to the agent with no filter at all — and the owner gets an out-of-band alert. Detection also runs after accent/zero-width-character normalization, so a message typed without diacritics (common on mobile, in languages that use them) can't slip past a pattern written with full accents.
 * 🔐 **Concurrency-Safe State:** The gateway hook and the watchdog cron share a per-conversation file lock and always write state atomically, so a scheduled takeover and a live incoming reply can never race and corrupt or silently lose conversation state.
 * 📢 **Telegram Dispatching:** Because WhatsApp notifications are muted by default, the owner receives real-time Telegram alerts on takeovers and final conversation handoffs.
+* 🧰 **Least-privilege by default:** the agent strangers can write to holds no tools — no memory, no calendar, no files, and no scheduler. What it holds is a form. Anything a contact asks for that touches the operator's world becomes a fixed-field request that deterministic code decides on, and that the operator confirms with one word. See `docs/least-privilege-profile.md`.
 * 🧷 **Update-safe by construction:** everything here lives under Hermes's user-plugin path (`HERMES_HOME/plugins`), which a `hermes update` never touches — that's precisely why `whatsapp-security-floor` is a plugin instead of a direct patch to vendored source. For the rarer case where you do end up needing a direct source patch, `docs/update-integration.md` documents a generic, idempotent reapply pattern to wire into your own update pipeline.
 
 ---
@@ -95,6 +96,7 @@ hermes-whatsapp-gatekeeper/
 └── docs/
     ├── update-integration.md                # generic idempotent-reapply pattern, for if you ever need a direct source patch
     ├── multiplex-profiles.md                # running the gatekeeper under a dedicated profile: the silent failure modes
+    ├── least-privilege-profile.md           # what that profile must NOT have, and how it asks for what it lacks
     └── architecture.md                      # defense-in-depth overview and design notes
 ```
 
@@ -149,6 +151,13 @@ Run `--check` from a daily job and you will hear about drift instead of discover
 from a conversation. See [docs/multiplex-profiles.md](docs/multiplex-profiles.md) for the
 rest of the per-profile failure modes, including why removing a contact from the allowlist
 also disables owner-takeover detection for that chat.
+
+Once the move works, [docs/least-privilege-profile.md](docs/least-privilege-profile.md)
+covers the harder question: what that profile is allowed to do at all. Which toolsets to
+disable (including the one everybody forgets), how to let the operator send a reply through
+the edge agent without handing it a general-purpose sender, how a contact's request becomes
+a reviewed form instead of an instruction, and how the edge agent asks a privileged agent a
+question over loopback in seconds.
 
 ---
 
