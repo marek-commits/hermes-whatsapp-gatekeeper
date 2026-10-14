@@ -710,6 +710,51 @@ def is_owner_timeout_expired(state: Dict[str, Any], timeout_minutes: Optional[fl
         return False
 
 
+
+# -- Reactions and short acknowledgements (v2.4.2) -------------------------
+# Live incident: the owner replied to a contact, the contact reacted with a
+# thumbs-up, and the guard treated that reaction as a brand-new question --
+# it re-armed the owner_response_timeout_minutes timer and the assistant
+# replied two hours later into a conversation the owner had already closed.
+#   * A reaction (the bridge forwards it as "[Reaction: ...]") never triggers
+#     a reply, in a DM or a group, whatever the conversation state.
+#   * A short acknowledgement ("ok", "thanks", "dakujem", emoji only, ...) in
+#     a DM never triggers a reply while the owner spoke last
+#     (status == "handled_by_owner").
+# Deliberately a small fixed word list: anything containing "?" or any longer
+# message still goes through the normal path.
+_ACK_WORDS = frozenset({
+    # English
+    "ok", "okay", "okey", "oki", "k", "thanks", "thx", "ty", "cheers", "great", "cool",
+    "fine", "noted", "sure", "yes", "yep", "yeah", "perfect", "nice",
+    # Slovak / Czech (accents are stripped before matching)
+    "okej", "jasne", "jasnacka", "jasan", "dik", "diky", "dikes", "dakujem", "dakujeme",
+    "vdaka", "vdacka", "dekuju", "dekujem", "super", "plati", "hej", "jj", "jo", "ano",
+    "fajn", "vyborne", "paci", "top", "rozumiem", "rozumim", "beriem", "dobre", "dobra",
+    "v", "poriadku", "tak", "uz", "nic",
+})
+_ACK_MAX_WORDS = 3
+
+
+def classify_ack(text: str) -> str:
+    """Return 'reaction', 'ack', or '' for a normal message."""
+    raw = (text or "").strip()
+    if not raw:
+        return ""
+    if raw.startswith("[Reaction:"):
+        return "reaction"
+    if "?" in raw or raw.startswith("["):
+        return ""
+    norm = unicodedata.normalize("NFKD", raw.lower())
+    norm = "".join(c for c in norm if not unicodedata.combining(c))
+    words = re.findall(r"[a-z0-9]+", norm)
+    if not words:
+        return "ack"  # emoji / punctuation only
+    if len(words) <= _ACK_MAX_WORDS and all(w in _ACK_WORDS for w in words):
+        return "ack"
+    return ""
+
+
 def register_incoming_dm_for_delay(chat_id: str, text: str, contact_name: str = "") -> Dict[str, Any]:
     """
     Registers a new incoming DM into the waiting-for-owner mode. If a wait
@@ -1065,6 +1110,31 @@ def _check_incoming_core(
             "reply": None,
             "telegram_notification": None,
         }
+
+    # 2.6 Reactions and short acknowledgements (v2.4.2): nothing to answer.
+    # Keep them in the conversation context, but do NOT touch the status,
+    # the owner-reply timer or the round counter.
+    _ack = classify_ack(text)
+    if _ack:
+        with state_lock(chat_id, sender_id):
+            state = load_state(chat_id, sender_id)
+            quiet = _ack == "reaction" or (
+                not is_group and state.get("status") == "handled_by_owner")
+            if quiet:
+                _append_recent_message(state, "contact", text)
+                if contact_name:
+                    state["contact_name"] = contact_name
+                save_state(chat_id, state, sender_id)
+        if quiet:
+            return {
+                "decision": "block",
+                "reason": ("Reaction — no reply needed" if _ack == "reaction"
+                           else "Acknowledgement after owner reply — no reply needed"),
+                "action": "ack_silent",
+                "state": state,
+                "reply": None,
+                "telegram_notification": None,
+            }
 
     # 3-5. Round-limit check, delayed DM handover, and the standard direct
     # reply — all under the conversation's lock, so the watchdog can't

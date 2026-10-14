@@ -359,3 +359,57 @@ def test_alert_env_ignores_unknown_profile(wg):
         assert wg.alert_env().get("HERMES_HOME") == os.environ.get("HERMES_HOME")
     finally:
         wg.CONFIG_PATH.unlink(missing_ok=True)
+
+
+
+# -- v2.4.2: reactions and short acknowledgements ---------------------------
+
+ACK_CASES = [
+    pytest.param("[Reaction: \U0001F44D to ABC123]", "reaction", id="reaction"),
+    pytest.param("ok", "ack", id="ok"),
+    pytest.param("Ok, dík!", "ack", id="ok-dik-accented"),
+    pytest.param("Ďakujem", "ack", id="dakujem"),
+    pytest.param("thanks", "ack", id="thanks"),
+    pytest.param("\U0001F44D", "ack", id="emoji-only"),
+    pytest.param("ok?", "", id="question-mark"),
+    pytest.param("ok a kedy sa stretneme", "", id="longer-message"),
+    pytest.param("[Image received]", "", id="media-placeholder"),
+]
+
+
+@pytest.mark.parametrize("text, expected", ACK_CASES)
+def test_classify_ack(wg, text, expected):
+    assert wg.classify_ack(text) == expected
+
+
+def test_reaction_after_owner_reply_does_not_rearm_timer(wg):
+    chat_id = "dispatch-ack-reaction@s.whatsapp.net"
+    wg.check_incoming(chat_id, "the developers confirmed the price")
+    wg.check_incoming(chat_id, "ok, I'll pass it on", from_me=True)
+    result = wg.check_incoming(chat_id, "[Reaction: \U0001F44D to ABC123]")
+    assert result["action"] == "ack_silent"
+    state = wg.load_state(chat_id)
+    assert state["status"] == "handled_by_owner"
+    assert state["waiting_since"] is None
+    assert any("Reaction" in m["text"] for m in state["recent_messages"])
+
+
+def test_short_ack_after_owner_reply_is_silent_but_question_is_not(wg):
+    chat_id = "dispatch-ack-text@s.whatsapp.net"
+    wg.check_incoming(chat_id, "can you send me the offer")
+    wg.check_incoming(chat_id, "sent", from_me=True)
+    assert wg.check_incoming(chat_id, "Dakujem!")["action"] == "ack_silent"
+    assert wg.load_state(chat_id)["status"] == "handled_by_owner"
+    result = wg.check_incoming(chat_id, "and when do we meet?")
+    assert result["action"] == "pending_owner_delay"
+
+
+def test_reaction_never_counts_a_round(wg):
+    chat_id = "dispatch-ack-in-progress@s.whatsapp.net"
+    state = wg.load_state(chat_id)
+    state["status"] = "in_progress_assistant"
+    state["rounds_completed"] = 2
+    wg.save_state(chat_id, state)
+    result = wg.check_incoming(chat_id, "[Reaction: \u2764 to XYZ]")
+    assert result["action"] == "ack_silent"
+    assert wg.load_state(chat_id)["rounds_completed"] == 2

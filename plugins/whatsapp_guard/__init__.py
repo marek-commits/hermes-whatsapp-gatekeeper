@@ -251,7 +251,7 @@ else:
 # never re-enable automatic replies in a group the operator has muted via
 # group_auto_reply_enabled — warn mode exists to test *detection patterns*,
 # not to bypass an explicit kill-switch.
-_ALWAYS_HARD_BLOCK_ACTIONS = {"warn_no_commands", "handoff_to_telegram", "silent_block", "pending_owner_delay", "owner_activity", "group_listen_only"}
+_ALWAYS_HARD_BLOCK_ACTIONS = {"warn_no_commands", "handoff_to_telegram", "silent_block", "pending_owner_delay", "owner_activity", "group_listen_only", "ack_silent"}
 
 
 # ── Platform detection ───────────────────────────────────────────────
@@ -349,7 +349,7 @@ def _pre_gateway_dispatch_handler(event: Any, gateway: Any = None, **kwargs: Any
     tg_notification = result.get("telegram_notification")
 
     # Waiting-for-owner mode (Delayed Gatekeeper) and owner-activity detection
-    if action in ("pending_owner_delay", "owner_activity"):
+    if action in ("pending_owner_delay", "owner_activity", "ack_silent"):
         logger.info("WhatsApp Guard: %s chat=%s", action.upper(), chat_id)
         # Block the message from reaching the agent
         return {"action": "skip", "reason": reason}
